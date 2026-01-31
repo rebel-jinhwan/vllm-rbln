@@ -67,6 +67,7 @@ def create_scheduler(
         trust_remote_code=True,
         dtype=torch.float,
         seed=42,
+        max_model_len=max_model_len,
     )
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,
@@ -132,6 +133,9 @@ def create_requests(
     block_hasher = get_request_block_hasher(block_size, sha256)
     if sample_json_schema:
         structured_outputs = StructuredOutputsParams(json=sample_json_schema)
+        # In v0.12, _backend is set by Processor._validate_structured_output
+        # at request time. In tests, we set it manually.
+        structured_outputs._backend = "xgrammar"
     else:
         structured_outputs = None
     sampling_params = SamplingParams(
