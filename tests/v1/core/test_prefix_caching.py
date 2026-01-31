@@ -16,7 +16,7 @@ import pytest
 import torch
 from vllm import SamplingParams
 from vllm.platforms import current_platform
-from vllm.utils import sha256
+from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import (get_request_block_hasher,
                                          init_none_hash)
 from vllm.v1.request import Request, RequestStatus
@@ -118,9 +118,12 @@ def create_request(
         ),
     ],
 )
-def test_prefix_cache_hit_same_prompt(scheduler, token_length: int,
-                                      cached_block_table: list[int],
-                                      cached_length: list[int]):
+def test_prefix_cache_hit_same_prompt(
+    scheduler,
+    token_length: int,
+    cached_block_table: list[int],
+    cached_length: list[int],
+):
     init_none_hash(HASH_FN)
     """
     Check the prefix caching works as expected
@@ -158,22 +161,29 @@ def test_prefix_cache_hit_same_prompt(scheduler, token_length: int,
     assert output.cached_length == cached_length
 
 
-@pytest.mark.parametrize("token_length, decode_steps, allocated_blocks", [
-    pytest.param(
-        31,
-        1,
-        [0, 1, 2, -1],
-        id="decode_1_step_and_eviction",
-    ),
-    pytest.param(
-        25,
-        7,
-        [0, 1, 2, -1],
-        id="decode_7_steps_eviction",
-    ),
-])
-def test_eviction(limited_4blocks_scheduler, token_length: int,
-                  decode_steps: int, allocated_blocks: list[int]):
+@pytest.mark.parametrize(
+    "token_length, decode_steps, allocated_blocks",
+    [
+        pytest.param(
+            31,
+            1,
+            [0, 1, 2, -1],
+            id="decode_1_step_and_eviction",
+        ),
+        pytest.param(
+            25,
+            7,
+            [0, 1, 2, -1],
+            id="decode_7_steps_eviction",
+        ),
+    ],
+)
+def test_eviction(
+    limited_4blocks_scheduler,
+    token_length: int,
+    decode_steps: int,
+    allocated_blocks: list[int],
+):
     init_none_hash(HASH_FN)
     """
     Check the eviction works as expected.
