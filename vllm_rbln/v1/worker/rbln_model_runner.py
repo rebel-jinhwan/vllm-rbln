@@ -571,7 +571,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         src_indices = orig_indices[sorted_order]
         src_dest_map = {
             int(src): int(dst)
-            for src, dst in zip(src_indices, orig_indices)
+            for src, dst in zip(src_indices, orig_indices, strict=False)
         }
 
         for src in src_dest_map:
@@ -2476,7 +2476,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Broadcast PP output for external_launcher (torchrun)
             # to make sure we are synced across pp ranks
-            # TODO: Support overlapping mirco-batches
+            # NOTE: Overlapping micro-batches (CPP) is handled in
+            # RBLNWorker via AsyncPPCommunicator for the mp backend.
             # https://github.com/vllm-project/vllm/issues/18019
             broadcast_pp_output = \
                 self.parallel_config.distributed_executor_backend \
