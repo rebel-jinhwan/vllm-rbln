@@ -17,11 +17,23 @@ When pipeline parallelism is enabled, each pipeline stage processes batches
 sequentially.  Without overlap, Stage 0 must wait for Stage 1 to receive
 its output before starting the next batch — creating a pipeline bubble.
 
-This module wraps the blocking ``send_tensor_dict`` call in a background
-thread so that the sending stage can immediately begin computing the next
-batch.  The engine core's ``step_with_batch_queue`` keeps multiple
-``SchedulerOutput`` objects in flight (up to ``pp_size``), which fills the
-pipeline and hides latency.
+This module uses ``torch.distributed.isend`` (non-blocking send) so that
+the sending stage can immediately begin computing the next batch.  The
+engine core's ``step_with_batch_queue`` keeps multiple ``SchedulerOutput``
+objects in flight (up to ``pp_size``), which fills the pipeline and hides
+communication latency.
+
+Protocol
+--------
+``send_tensor_dict`` in vLLM's ``GroupCoordinator`` sends:
+
+1. **Metadata** (blocking) — pickle-serialized list of ``(key, value)``
+   pairs where tensor values are replaced by ``TensorMetadata``.
+   Two blocking sends: size tensor, then serialized object.
+2. **Tensor data** — one ``send()`` per tensor in dict order.
+
+We keep step 1 blocking (receiver needs metadata to allocate buffers)
+and replace step 2 with ``isend()`` for non-blocking tensor transfer.
 
 Correctness guarantee
 ---------------------
@@ -31,8 +43,10 @@ buffers are reused across batches.  The current call-site places the wait
 at the top of ``RBLNWorker.execute_model``, satisfying this invariant.
 """
 
-import threading
-from typing import Any, Optional
+from typing import Any
+
+import torch
+import torch.distributed
 
 from vllm_rbln.logger import init_logger
 
@@ -40,18 +54,20 @@ logger = init_logger(__name__)
 
 
 class AsyncPPCommunicator:
-    """Thread-based async sender for pipeline-parallel P2P communication.
+    """Non-blocking sender for pipeline-parallel P2P communication.
 
-    One in-flight send is allowed at a time.  The caller is responsible for
-    invoking ``wait_pending_send`` before the underlying tensor buffers are
-    overwritten (see module docstring).
+    Uses ``torch.distributed.isend`` for tensor data to overlap
+    communication with computation.  Metadata is still sent blocking
+    because the receiver needs it to allocate tensor buffers.
+
+    One set of in-flight sends is allowed at a time.  The caller is
+    responsible for invoking ``wait_pending_send`` before the underlying
+    tensor buffers are overwritten (see module docstring).
     """
 
     def __init__(self, pp_group) -> None:
         self._pp_group = pp_group
-        self._send_thread: Optional[threading.Thread] = None
-        self._send_error: Optional[BaseException] = None
-        self._error_lock = threading.Lock()
+        self._pending_works: list[torch.distributed.Work] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -61,57 +77,63 @@ class AsyncPPCommunicator:
         self,
         tensor_dict: dict[str, Any],
     ) -> None:
-        """Start a non-blocking send of *tensor_dict* to the next PP stage.
+        """Send *tensor_dict* to the next PP stage with non-blocking
+        tensor transfer.
 
-        The actual ``send_tensor_dict`` runs in a daemon thread.  The
-        caller **must not** mutate *tensor_dict* (or the tensors it
+        Metadata is sent synchronously (receiver needs it to allocate
+        buffers).  Tensor payloads use ``isend`` and can be waited on
+        later via ``wait_pending_send``.
+
+        The caller **must not** mutate *tensor_dict* (or the tensors it
         references) until the next ``wait_pending_send`` returns.
         """
-        # Defensive: should already have been called by the worker, but
-        # guard against misuse.
+        # Ensure previous sends completed before starting new ones.
         self.wait_pending_send()
 
-        self._send_error = None
-        self._send_thread = threading.Thread(
-            target=self._do_send,
-            args=(tensor_dict, ),
-            daemon=True,
-        )
-        self._send_thread.start()
+        pg = self._pp_group
+
+        # Determine destination (next rank in PP ring).
+        dst_local = (pg.rank_in_group + 1) % pg.world_size
+        dst_global = pg.ranks[dst_local]
+        metadata_group = pg.cpu_group
+
+        # --- Step 1: metadata (blocking) ---
+        # Reuse vLLM's existing protocol: send_object sends
+        # (size_tensor, object_tensor) via two blocking sends.
+        # _split_tensor_dict is a module-level helper in parallel_state.
+        from vllm.distributed.parallel_state import _split_tensor_dict
+
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        pg.send_object(metadata_list, dst=dst_local)
+
+        # --- Step 2: tensor data (non-blocking via isend) ---
+        works: list[torch.distributed.Work] = []
+        for tensor in tensor_list:
+            if tensor.numel() == 0:
+                continue
+            work = torch.distributed.isend(
+                tensor,
+                dst=dst_global,
+                group=metadata_group,
+            )
+            works.append(work)
+
+        self._pending_works = works
 
     def wait_pending_send(self) -> None:
-        """Block until the in-flight send completes (if any).
+        """Block until all in-flight ``isend`` operations complete.
 
-        Re-raises any exception captured by the background thread.
+        Must be called before reusing the tensor buffers that were passed
+        to ``async_send_tensor_dict``.
         """
-        if self._send_thread is None:
-            return
-
-        self._send_thread.join()
-        self._send_thread = None
-
-        with self._error_lock:
-            if self._send_error is not None:
-                err = self._send_error
-                self._send_error = None
-                raise RuntimeError("Async PP send failed") from err
+        for work in self._pending_works:
+            work.wait()
+        self._pending_works.clear()
 
     def shutdown(self) -> None:
-        """Best-effort cleanup — wait for the last send."""
+        """Best-effort cleanup — wait for any outstanding sends."""
         try:
             self.wait_pending_send()
         except Exception:
             logger.warning("Error during AsyncPPCommunicator shutdown",
                            exc_info=True)
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _do_send(self, tensor_dict: dict[str, Any]) -> None:
-        try:
-            self._pp_group.send_tensor_dict(tensor_dict)
-        except BaseException as exc:
-            with self._error_lock:
-                self._send_error = exc
-            logger.error("Async PP send raised: %s", exc)
