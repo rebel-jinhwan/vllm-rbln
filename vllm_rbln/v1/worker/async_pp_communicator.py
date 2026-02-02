@@ -47,6 +47,7 @@ from typing import Any
 
 import torch
 import torch.distributed
+from vllm.distributed.parallel_state import _split_tensor_dict
 
 from vllm_rbln.logger import init_logger
 
@@ -95,14 +96,11 @@ class AsyncPPCommunicator:
         # Determine destination (next rank in PP ring).
         dst_local = (pg.rank_in_group + 1) % pg.world_size
         dst_global = pg.ranks[dst_local]
-        metadata_group = pg.cpu_group
+        cpu_group = pg.cpu_group
 
         # --- Step 1: metadata (blocking) ---
         # Reuse vLLM's existing protocol: send_object sends
         # (size_tensor, object_tensor) via two blocking sends.
-        # _split_tensor_dict is a module-level helper in parallel_state.
-        from vllm.distributed.parallel_state import _split_tensor_dict
-
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         pg.send_object(metadata_list, dst=dst_local)
 
@@ -114,7 +112,7 @@ class AsyncPPCommunicator:
             work = torch.distributed.isend(
                 tensor,
                 dst=dst_global,
-                group=metadata_group,
+                group=cpu_group,
             )
             works.append(work)
 
@@ -124,11 +122,15 @@ class AsyncPPCommunicator:
         """Block until all in-flight ``isend`` operations complete.
 
         Must be called before reusing the tensor buffers that were passed
-        to ``async_send_tensor_dict``.
+        to ``async_send_tensor_dict``.  Safe to call when no sends are
+        pending (no-op).
         """
-        for work in self._pending_works:
+        # Swap out the list first so that a failing wait() does not leave
+        # stale Work objects that would be re-waited on the next call.
+        works = self._pending_works
+        self._pending_works = []
+        for work in works:
             work.wait()
-        self._pending_works.clear()
 
     def shutdown(self) -> None:
         """Best-effort cleanup — wait for any outstanding sends."""

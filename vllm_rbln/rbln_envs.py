@@ -152,8 +152,8 @@ environment_variables = {
     "VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT":
     lambda: int(os.environ.get("VLLM_RBLN_DECODE_BATCH_BUCKET_LIMIT", 1)),
     # Enable async P2P send for chunked pipeline parallelism (CPP).
-    # When True, non-last PP ranks send intermediate tensors in a
-    # background thread, allowing immediate computation of the next batch.
+    # When True, non-last PP ranks send intermediate tensors via
+    # non-blocking isend, allowing immediate computation of the next batch.
     "VLLM_RBLN_ASYNC_PP_SEND":
     (lambda: os.environ.get("VLLM_RBLN_ASYNC_PP_SEND", "True").lower() in
      ("true", "1")),

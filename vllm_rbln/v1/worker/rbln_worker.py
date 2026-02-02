@@ -39,7 +39,6 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
-from vllm_rbln.v1.worker.async_pp_communicator import AsyncPPCommunicator
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.worker.utils import estimate_available_memory
 
@@ -117,7 +116,7 @@ class RBLNWorker(WorkerBase):
 
         # Async P2P for Chunked Pipeline Parallelism (CPP).
         # Initialized lazily in init_device() once the PP group exists.
-        self._pp_communicator: AsyncPPCommunicator | None = None
+        self._pp_communicator = None
 
     def sleep(self, level: int = 1) -> None:
         logger.warning("sleep mode is not supported on RBLN, ignore it.")
@@ -187,12 +186,14 @@ class RBLNWorker(WorkerBase):
 
         # Enable async P2P send for non-last PP ranks.
         # The engine core's batch queue (size = pp_size) keeps multiple
-        # SchedulerOutputs in flight; async send lets this stage start the
-        # next batch while the blocking send_tensor_dict runs in the
-        # background thread.
+        # SchedulerOutputs in flight; async isend lets this stage start
+        # the next batch while tensor data transfers in the background.
         pp_size = self.parallel_config.pipeline_parallel_size
         if (pp_size > 1 and not get_pp_group().is_last_rank
                 and envs.VLLM_RBLN_ASYNC_PP_SEND):
+            from vllm_rbln.v1.worker.async_pp_communicator import (
+                AsyncPPCommunicator)
+
             self._pp_communicator = AsyncPPCommunicator(get_pp_group())
             logger.info(
                 "Async PP send enabled (pp_size=%d, rank=%d)",
@@ -324,9 +325,9 @@ class RBLNWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
-        # CPP: ensure the previous async send completed before the model
+        # CPP: ensure any previous isend() completed before the model
         # runner re-enters forward (which may reuse intermediate-tensor
-        # buffers).
+        # buffers).  No-op when no sends are pending.
         if self._pp_communicator is not None:
             self._pp_communicator.wait_pending_send()
 
@@ -344,12 +345,15 @@ class RBLNWorker(WorkerBase):
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
-        assert (parallel_config.distributed_executor_backend
-                != ("external_launcher") and not get_pp_group().is_last_rank)
+        assert parallel_config.distributed_executor_backend != (
+            "external_launcher"
+        ), "external_launcher PP send is handled in rbln_model_runner"
+        assert not get_pp_group().is_last_rank, (
+            "last PP rank should return ModelRunnerOutput, "
+            "not IntermediateTensors")
 
-        # CPP: use async send so this worker can immediately start the
-        # next batch.  The background thread handles the blocking
-        # send_tensor_dict; we synchronise at the top of the next call.
+        # CPP: use isend so this worker can immediately start the next
+        # batch; we synchronise at the top of the next execute_model call.
         if self._pp_communicator is not None:
             self._pp_communicator.async_send_tensor_dict(output.tensors)
         else:

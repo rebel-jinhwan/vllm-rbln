@@ -51,17 +51,9 @@ python test_cpp.py --model meta-llama/Llama-3.2-1B --pp 2 --correctness --benchm
 """
 
 import argparse
+import gc
 import os
 import time
-
-os.environ.setdefault("VLLM_RBLN_USE_VLLM_MODEL", "1")
-os.environ.setdefault("VLLM_USE_V1", "1")
-# Required: batch attention opt provides (B, 1) seq_idx to the compiler
-# instead of (B, num_partition) dyn_size_for_partitions which fails compilation.
-os.environ.setdefault("VLLM_RBLN_BATCH_ATTN_OPT", "1")
-
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
 
 
 def parse_args():
@@ -105,6 +97,8 @@ def parse_args():
 
 def build_llm(args, pp_override=None):
     """Create an LLM instance with the given PP override."""
+    from vllm import LLM
+
     pp = pp_override if pp_override is not None else args.pp
     return LLM(
         model=args.model,
@@ -121,24 +115,15 @@ def build_llm(args, pp_override=None):
     )
 
 
-def make_prompts(tokenizer, num_requests, input_len):
-    """Build deterministic prompts with exactly *input_len* tokens each."""
-    # Use token IDs directly to guarantee exact length
-    dummy_ids = [1] * input_len  # token ID 1 repeated
-    prompt_text = tokenizer.decode(dummy_ids, skip_special_tokens=True)
-    # Verify and adjust
-    encoded = tokenizer.encode(prompt_text, add_special_tokens=True)
-    if len(encoded) != input_len:
-        # Fallback: repeat a single-char token
-        vocab = iter(tokenizer.vocab)
-        single_tok = next(vocab)
-        while True:
-            if len(tokenizer.encode(single_tok * 2,
-                                    add_special_tokens=False)) == 2:
-                break
-            single_tok = next(vocab)
-        prompt_text = single_tok * (input_len - 1)
-    return [prompt_text] * num_requests
+def make_prompts(num_requests, input_len):
+    """Build deterministic prompts with exactly *input_len* tokens each.
+
+    Returns token-ID lists (prompt_token_ids) to guarantee exact length,
+    avoiding encode/decode round-trip mismatches.
+    """
+    # Token ID 1 is a safe dummy in most tokenizers.
+    prompt_ids = [1] * input_len
+    return [prompt_ids] * num_requests
 
 
 # -----------------------------------------------------------------------
@@ -146,6 +131,8 @@ def make_prompts(tokenizer, num_requests, input_len):
 # -----------------------------------------------------------------------
 def run_correctness_test(args):
     """Generate with PP=1 and PP=N, compare token-by-token."""
+    from vllm import SamplingParams
+
     sampling = SamplingParams(temperature=0.0, max_tokens=args.output_len)
 
     prompts = [
@@ -163,7 +150,8 @@ def run_correctness_test(args):
     llm_ref = build_llm(args, pp_override=1)
     ref_outputs = llm_ref.generate(prompts, sampling)
     ref_texts = [o.outputs[0].text for o in ref_outputs]
-    del llm_ref  # free resources
+    del llm_ref
+    gc.collect()  # release NPU memory
 
     # ---- PP=N ----
     print(f"\n[2/2] Running PP={args.pp} ...")
@@ -171,6 +159,7 @@ def run_correctness_test(args):
     pp_outputs = llm_pp.generate(prompts, sampling)
     pp_texts = [o.outputs[0].text for o in pp_outputs]
     del llm_pp
+    gc.collect()
 
     # ---- compare ----
     all_match = True
@@ -196,6 +185,8 @@ def run_correctness_test(args):
 # -----------------------------------------------------------------------
 def run_benchmark(args):
     """Measure TTFT and decode throughput with chunked-prefill + PP."""
+    from vllm import SamplingParams
+
     print("=" * 60)
     print(f"Benchmark: PP={args.pp}  chunk={args.max_num_batched_tokens}  "
           f"requests={args.num_requests}  in={args.input_len}  "
@@ -204,8 +195,7 @@ def run_benchmark(args):
         f"  async_pp_send = {os.environ.get('VLLM_RBLN_ASYNC_PP_SEND', '1')}")
     print("=" * 60)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    prompts = make_prompts(tokenizer, args.num_requests, args.input_len)
+    prompt_ids = make_prompts(args.num_requests, args.input_len)
 
     sampling = SamplingParams(
         temperature=0.0,
@@ -217,13 +207,17 @@ def run_benchmark(args):
 
     # Warmup
     print(f"\nWarmup ({args.warmup_requests} requests) ...")
-    _ = llm.generate(prompts[:min(len(prompts), args.warmup_requests)],
-                     sampling)
+    _ = llm.generate(
+        prompt_token_ids=prompt_ids[:min(len(prompt_ids), args.warmup_requests
+                                         )],
+        sampling_params=sampling,
+    )
 
     # Timed run
     print("Timed run ...")
     t0 = time.perf_counter()
-    outputs = llm.generate(prompts, sampling)
+    outputs = llm.generate(prompt_token_ids=prompt_ids,
+                           sampling_params=sampling)
     elapsed = time.perf_counter() - t0
 
     # Validate output shapes
@@ -251,10 +245,18 @@ def run_benchmark(args):
     print(f"  Requests/sec:         {args.num_requests / elapsed:.2f}")
 
     del llm
+    gc.collect()
     return elapsed
 
 
 def main():
+    # Environment must be set before vLLM imports trigger module-level init.
+    os.environ.setdefault("VLLM_RBLN_USE_VLLM_MODEL", "1")
+    os.environ.setdefault("VLLM_USE_V1", "1")
+    # Required: batch attention opt provides (B, 1) seq_idx to the compiler
+    # instead of (B, num_partition) dyn_size_for_partitions which fails.
+    os.environ.setdefault("VLLM_RBLN_BATCH_ATTN_OPT", "1")
+
     args = parse_args()
 
     if not args.correctness and not args.benchmark:
