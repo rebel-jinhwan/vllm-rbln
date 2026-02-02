@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """A RBLN worker class."""
+
 import copy
 import os
 from types import NoneType
@@ -85,8 +86,10 @@ class RBLNWorker(WorkerBase):
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
-            logger.info("Profiling enabled. Traces will be saved to: %s",
-                        torch_profiler_trace_dir)
+            logger.info(
+                "Profiling enabled. Traces will be saved to: %s",
+                torch_profiler_trace_dir,
+            )
             logger.debug(
                 "Profiler config: record_shapes=%s,"
                 "profile_memory=%s,with_stack=%s,with_flops=%s",
@@ -104,11 +107,16 @@ class RBLNWorker(WorkerBase):
                 with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
                 with_flops=envs.VLLM_TORCH_PROFILER_WITH_FLOPS,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir, use_gzip=True))
+                    torch_profiler_trace_dir, use_gzip=True),
+            )
         else:
             self.profiler = None
 
         self.parallel_config.disable_custom_all_reduce = True
+
+        # Async P2P for Chunked Pipeline Parallelism (CPP).
+        # Initialized lazily in init_device() once the PP group exists.
+        self._pp_communicator = None
 
     def sleep(self, level: int = 1) -> None:
         logger.warning("sleep mode is not supported on RBLN, ignore it.")
@@ -130,8 +138,8 @@ class RBLNWorker(WorkerBase):
         total_device_count = world_size * envs.VLLM_RBLN_TP_SIZE
 
         if env_var not in os.environ:
-            dev_begin = total_device_count * \
-                self.parallel_config.data_parallel_rank
+            dev_begin = (total_device_count *
+                         self.parallel_config.data_parallel_rank)
             dev_end = dev_begin + total_device_count
             device_ids = [str(i) for i in range(dev_begin, dev_end)]
             start_idx = self.local_rank * envs.VLLM_RBLN_TP_SIZE
@@ -139,9 +147,9 @@ class RBLNWorker(WorkerBase):
             selected_devices = ",".join(device_ids[start_idx:end_idx])
         else:
             device_ids = os.environ[env_var].split(",")
-            assert len(device_ids) == world_size, \
-                f"device_ids: {device_ids} " \
-                f"should have device count: {world_size}"
+            assert len(device_ids) == world_size, (
+                f"device_ids: {device_ids} "
+                f"should have device count: {world_size}")
             try:
                 device_id = int(device_ids[self.local_rank])
                 start_idx = device_id * envs.VLLM_RBLN_TP_SIZE
@@ -150,8 +158,8 @@ class RBLNWorker(WorkerBase):
                 selected_devices = ",".join(device_ids)
             except ValueError as e:
                 raise ValueError(
-                    f"device_ids: {device_ids} should be a list of integers") \
-                        from e
+                    f"device_ids: {device_ids} should be a list of integers"
+                ) from e
 
         os.environ[env_var] = selected_devices
         logger.info(
@@ -162,16 +170,36 @@ class RBLNWorker(WorkerBase):
 
     def init_device(self) -> None:
         # Initialize the distributed environment.
-        init_worker_distributed_environment(self.vllm_config, self.rank,
-                                            self.distributed_init_method,
-                                            self.local_rank,
-                                            current_platform.dist_backend)
+        init_worker_distributed_environment(
+            self.vllm_config,
+            self.rank,
+            self.distributed_init_method,
+            self.local_rank,
+            current_platform.dist_backend,
+        )
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
         self.model_runner: RBLNModelRunner = RBLNModelRunner(
             self.vllm_config, self.device)
+
+        # Enable async P2P send for non-last PP ranks.
+        # The engine core's batch queue (size = pp_size) keeps multiple
+        # SchedulerOutputs in flight; async isend lets this stage start
+        # the next batch while tensor data transfers in the background.
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if (pp_size > 1 and not get_pp_group().is_last_rank
+                and envs.VLLM_RBLN_ASYNC_PP_SEND):
+            from vllm_rbln.v1.worker.async_pp_communicator import (
+                AsyncPPCommunicator)
+
+            self._pp_communicator = AsyncPPCommunicator(get_pp_group())
+            logger.info(
+                "Async PP send enabled (pp_size=%d, rank=%d)",
+                pp_size,
+                self.rank,
+            )
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -194,7 +222,9 @@ class RBLNWorker(WorkerBase):
             # single device == Quad chiplet
             num_runtimes = 2 * 4
         else:
-            assert False, "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+            assert False, (
+                "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+            )
 
         if self.model_config.quantization is not None:
             # FIXME(RBLN) - for now, mxfp4 quantization is only supported
@@ -211,7 +241,9 @@ class RBLNWorker(WorkerBase):
                 nbits_per_param = 4
                 ratio = 1
             else:
-                assert False, "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+                assert False, (
+                    "invalid RBLN architecture, candidates = [ATOM(ca), REBEL(cr)]"
+                )
 
             # pack 2 mxfp4 elems into single uint8 elem
             packed_num_elems = 8 // 4
@@ -239,8 +271,10 @@ class RBLNWorker(WorkerBase):
             gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
         )
 
-        logger.info("available_memory_estimate = %.2f GB",
-                    available_memory_estimate / 10**9)
+        logger.info(
+            "available_memory_estimate = %.2f GB",
+            available_memory_estimate / 10**9,
+        )
 
         return available_memory_estimate
 
@@ -254,14 +288,14 @@ class RBLNWorker(WorkerBase):
     def compile_or_warm_up_model(self) -> None:
         if self.parallel_config.data_parallel_size > 1:
             if envs.VLLM_RBLN_DP_IMPL == "padded_decode":
-                max_num_batched_tokens = \
-                    self.scheduler_config.max_num_batched_tokens
+                max_num_batched_tokens = (
+                    self.scheduler_config.max_num_batched_tokens)
                 max_num_seqs = self.scheduler_config.max_num_seqs
                 # TODO: consider relaxing this constraint
-                assert max_num_batched_tokens % max_num_seqs == 0, \
-                    "max_num_batched_tokens must be divisible by max_num_seqs"
+                assert max_num_batched_tokens % max_num_seqs == 0, (
+                    "max_num_batched_tokens must be divisible by max_num_seqs")
             elif envs.VLLM_RBLN_DP_IMPL == "dummy_prefill":
-                raise ValueError("dummy_prefill is not supported in v1 worker" \
+                raise ValueError("dummy_prefill is not supported in v1 worker"
                                  "and will be deprecated in the future")
             self.model_runner.prepare_dummy_run()
 
@@ -291,6 +325,12 @@ class RBLNWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
+        # CPP: ensure any previous isend() completed before the model
+        # runner re-enters forward (which may reuse intermediate-tensor
+        # buffers).  No-op when no sends are pending.
+        if self._pp_communicator is not None:
+            self._pp_communicator.wait_pending_send()
+
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
@@ -306,10 +346,19 @@ class RBLNWorker(WorkerBase):
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
         assert parallel_config.distributed_executor_backend != (
-            "external_launcher") and not get_pp_group().is_last_rank
+            "external_launcher"
+        ), "external_launcher PP send is handled in rbln_model_runner"
+        assert not get_pp_group().is_last_rank, (
+            "last PP rank should return ModelRunnerOutput, "
+            "not IntermediateTensors")
 
-        # NOTE - DO NOT all_gather_group for RBLN pp
-        get_pp_group().send_tensor_dict(output.tensors)
+        # CPP: use isend so this worker can immediately start the next
+        # batch; we synchronise at the top of the next execute_model call.
+        if self._pp_communicator is not None:
+            self._pp_communicator.async_send_tensor_dict(output.tensors)
+        else:
+            # NOTE - DO NOT all_gather_group for RBLN pp
+            get_pp_group().send_tensor_dict(output.tensors)
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
             return None
@@ -360,6 +409,8 @@ class RBLNWorker(WorkerBase):
 
     def shutdown(self) -> None:
         logger.info("v1 rbln_worker shutdown called")
+        if self._pp_communicator is not None:
+            self._pp_communicator.shutdown()
         if envs.VLLM_RBLN_METRICS:
             # FIXME - performance tracker atexit is not called
             self.model_runner.performance_tracker.print_final_stats()
@@ -377,8 +428,8 @@ def init_worker_distributed_environment(
     world_size = parallel_config.world_size
 
     # Set envs for RCCL
-    os.environ['LOCAL_RANK'] = str(rank)
-    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
 
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
@@ -387,11 +438,14 @@ def init_worker_distributed_environment(
         dp_rank = parallel_config.data_parallel_rank
         rank_across_dp = dp_rank * world_size
         rank_across_dp += rank
-        logger.info("world_size_across_dp = %s, rank_across_dp = %s",
-                    world_size_across_dp, rank_across_dp)
+        logger.info(
+            "world_size_across_dp = %s, rank_across_dp = %s",
+            world_size_across_dp,
+            rank_across_dp,
+        )
         # consider across_dp
-        os.environ['LOCAL_RANK'] = str(rank_across_dp)
-        os.environ['WORLD_SIZE'] = str(world_size_across_dp)
+        os.environ["LOCAL_RANK"] = str(rank_across_dp)
+        os.environ["WORLD_SIZE"] = str(world_size_across_dp)
 
     init_distributed_environment(
         world_size,
