@@ -58,7 +58,8 @@ import time
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="CPP (Chunked Pipeline Parallelism) test & benchmark")
+        description="CPP (Chunked Pipeline Parallelism) test & benchmark"
+    )
     p.add_argument("--model", type=str, default="meta-llama/Llama-3.2-1B")
     p.add_argument("--pp", type=int, default=2, help="pipeline_parallel_size")
     p.add_argument("--tp", type=int, default=1, help="tensor_parallel_size")
@@ -76,6 +77,12 @@ def parse_args():
         help="Chunk size for chunked prefill",
     )
     p.add_argument("--block-size", type=int, default=1024)
+    p.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.8,
+        help="Fraction of device memory for KV cache (lower to avoid OOM)",
+    )
 
     # Test modes
     p.add_argument(
@@ -83,9 +90,9 @@ def parse_args():
         action="store_true",
         help="Run correctness test (PP=1 vs PP=N)",
     )
-    p.add_argument("--benchmark",
-                   action="store_true",
-                   help="Run performance benchmark")
+    p.add_argument(
+        "--benchmark", action="store_true", help="Run performance benchmark"
+    )
 
     # Benchmark parameters
     p.add_argument("--num-requests", type=int, default=32)
@@ -110,7 +117,7 @@ def build_llm(args, pp_override=None):
         pipeline_parallel_size=pp,
         enable_chunked_prefill=True,
         enable_prefix_caching=False,
-        gpu_memory_utilization=1.0,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         trust_remote_code=True,
     )
 
@@ -118,12 +125,12 @@ def build_llm(args, pp_override=None):
 def make_prompts(num_requests, input_len):
     """Build deterministic prompts with exactly *input_len* tokens each.
 
-    Returns token-ID lists (prompt_token_ids) to guarantee exact length,
-    avoiding encode/decode round-trip mismatches.
+    Returns a list of ``TokensPrompt`` dicts compatible with ``LLM.generate()``,
+    guaranteeing exact token length without encode/decode round-trip mismatches.
     """
     # Token ID 1 is a safe dummy in most tokenizers.
     prompt_ids = [1] * input_len
-    return [prompt_ids] * num_requests
+    return [{"prompt_token_ids": prompt_ids} for _ in range(num_requests)]
 
 
 # -----------------------------------------------------------------------
@@ -188,11 +195,12 @@ def run_benchmark(args):
     from vllm import SamplingParams
 
     print("=" * 60)
-    print(f"Benchmark: PP={args.pp}  chunk={args.max_num_batched_tokens}  "
-          f"requests={args.num_requests}  in={args.input_len}  "
-          f"out={args.output_len}")
     print(
-        f"  async_pp_send = {os.environ.get('VLLM_RBLN_ASYNC_PP_SEND', '1')}")
+        f"Benchmark: PP={args.pp}  chunk={args.max_num_batched_tokens}  "
+        f"requests={args.num_requests}  in={args.input_len}  "
+        f"out={args.output_len}"
+    )
+    print(f"  async_pp_send = {os.environ.get('VLLM_RBLN_ASYNC_PP_SEND', '1')}")
     print("=" * 60)
 
     prompt_ids = make_prompts(args.num_requests, args.input_len)
@@ -208,16 +216,14 @@ def run_benchmark(args):
     # Warmup
     print(f"\nWarmup ({args.warmup_requests} requests) ...")
     _ = llm.generate(
-        prompt_token_ids=prompt_ids[:min(len(prompt_ids), args.warmup_requests
-                                         )],
+        prompts=prompt_ids[: min(len(prompt_ids), args.warmup_requests)],
         sampling_params=sampling,
     )
 
     # Timed run
     print("Timed run ...")
     t0 = time.perf_counter()
-    outputs = llm.generate(prompt_token_ids=prompt_ids,
-                           sampling_params=sampling)
+    outputs = llm.generate(prompts=prompt_ids, sampling_params=sampling)
     elapsed = time.perf_counter() - t0
 
     # Validate output shapes
@@ -226,12 +232,15 @@ def run_benchmark(args):
     ]
     output_lens = [len(o.outputs[0].token_ids) for o in outputs]
     if any(l != args.input_len for l in input_lens):
-        print(f"  WARNING: Input length mismatch. Expected {args.input_len}, "
-              f"got {set(input_lens)}")
+        print(
+            f"  WARNING: Input length mismatch. Expected {args.input_len}, "
+            f"got {set(input_lens)}"
+        )
     if any(l != args.output_len for l in output_lens):
         print(
             f"  WARNING: Output length mismatch. Expected {args.output_len}, "
-            f"got {set(output_lens)}")
+            f"got {set(output_lens)}"
+        )
 
     total_input_tokens = args.num_requests * args.input_len
     total_output_tokens = args.num_requests * args.output_len
@@ -240,8 +249,10 @@ def run_benchmark(args):
     print(f"  Total time:           {elapsed:.2f} s")
     print(f"  Prefill throughput:   {total_input_tokens / elapsed:.0f} tok/s")
     print(f"  Decode throughput:    {total_output_tokens / elapsed:.0f} tok/s")
-    print(f"  Total throughput:     "
-          f"{(total_input_tokens + total_output_tokens) / elapsed:.0f} tok/s")
+    print(
+        f"  Total throughput:     "
+        f"{(total_input_tokens + total_output_tokens) / elapsed:.0f} tok/s"
+    )
     print(f"  Requests/sec:         {args.num_requests / elapsed:.2f}")
 
     del llm
@@ -260,8 +271,10 @@ def main():
     args = parse_args()
 
     if not args.correctness and not args.benchmark:
-        print("Specify --correctness and/or --benchmark. "
-              "Running both by default.\n")
+        print(
+            "Specify --correctness and/or --benchmark. "
+            "Running both by default.\n"
+        )
         args.correctness = True
         args.benchmark = True
 
