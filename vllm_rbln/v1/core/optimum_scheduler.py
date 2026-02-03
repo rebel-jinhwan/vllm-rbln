@@ -52,6 +52,7 @@ class RBLNSchedulerOutput(SchedulerOutput):
         if the number of requests is less than the number of batch_size
         in decode phase.
     """
+
     block_table_dict: dict[str, torch.Tensor] = None
     cached_block_table: list[int] = field(default_factory=list)
     cached_length: list[int] = field(default_factory=list)
@@ -89,12 +90,16 @@ class RBLNOptimumScheduler(Scheduler):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
-        self.max_num_scheduled_tokens = \
-            self.scheduler_config.max_num_batched_tokens
-        self.max_model_len = self.scheduler_config.max_model_len
+        self.max_num_scheduled_tokens = (
+            self.scheduler_config.max_num_batched_tokens)
+        self.max_model_len = vllm_config.model_config.max_model_len
         # KVConnector and KVEventPublisher is not used in RBLN.
         self.connector = None
+        self.connector_prefix_cache_stats = None
         self.kv_event_publisher = None
+        self.ec_connector = None
+        self.kv_metrics_collector = None
+        self.failed_recving_kv_req_ids: set[str] = set()
         num_gpu_blocks = self.cache_config.num_gpu_blocks
         assert num_gpu_blocks is not None and num_gpu_blocks > 0
 
@@ -127,8 +132,8 @@ class RBLNOptimumScheduler(Scheduler):
         self.encoder_cache_manager = EncoderCacheManager(cache_size=0)
 
         # Create the KV cache manager.
-        if self.vllm_config.additional_config is not None \
-            and "attn_block_size" in self.vllm_config.additional_config:
+        if (self.vllm_config.additional_config is not None
+                and "attn_block_size" in self.vllm_config.additional_config):
             attn_block_size = self.vllm_config.additional_config[
                 "attn_block_size"]
         else:
@@ -145,6 +150,7 @@ class RBLNOptimumScheduler(Scheduler):
             max_num_seqs=self.max_num_running_reqs,
         )
 
+        self.prev_step_scheduled_req_ids: set[str] = set()
         self.use_pp = False
 
     def schedule(self) -> RBLNSchedulerOutput:
@@ -234,9 +240,8 @@ class RBLNOptimumScheduler(Scheduler):
 
                 assert request.num_computed_tokens == 0
                 # Get locally-cached tokens.
-                new_computed_blocks, num_new_local_computed_tokens = \
-                    self.kv_cache_manager.get_computed_blocks(
-                        request)
+                new_computed_blocks, num_new_local_computed_tokens = (
+                    self.kv_cache_manager.get_computed_blocks(request))
 
                 # Number of tokens to be scheduled.
                 # We use `request.num_tokens` instead of
@@ -318,7 +323,8 @@ class RBLNOptimumScheduler(Scheduler):
                 # This is necessary when using spec decoding.
                 num_new_tokens = min(
                     num_new_tokens,
-                    self.max_model_len - 1 - request.num_computed_tokens)
+                    self.max_model_len - 1 - request.num_computed_tokens,
+                )
 
                 if num_new_tokens == 0:
                     # The request cannot be scheduled
@@ -363,13 +369,16 @@ class RBLNOptimumScheduler(Scheduler):
                             ]
                         logger.warning(
                             "Request %s is preempted. Freed block(s): %s",
-                            preempted_req.request_id, preempted_blocks)
+                            preempted_req.request_id,
+                            preempted_blocks,
+                        )
                         preempted_req.status = RequestStatus.PREEMPTED
                         preempted_req.num_computed_tokens = 0
                         if self.log_stats:
                             preempted_req.record_event(
                                 EngineCoreEventType.PREEMPTED,
-                                scheduled_timestamp)
+                                scheduled_timestamp,
+                            )
 
                         self.waiting.prepend_request(preempted_req)
                         preempted_reqs.append(preempted_req)
@@ -403,8 +412,8 @@ class RBLNOptimumScheduler(Scheduler):
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
-        assert (len(scheduled_new_reqs) + len(scheduled_resumed_reqs) +
-                len(scheduled_running_reqs) <= len(self.running))
+        assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
+            scheduled_running_reqs) <= len(self.running)
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.
@@ -414,7 +423,7 @@ class RBLNOptimumScheduler(Scheduler):
             any_request = self.running[0]
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
-                    any_request, len(self.running)))
+                    any_request.request_id))
 
         # Construct the scheduler output.
         new_reqs_data = [
@@ -430,17 +439,16 @@ class RBLNOptimumScheduler(Scheduler):
             scheduled_spec_decode_tokens,
             req_to_new_blocks,
         )
-        structured_output_request_ids, grammar_bitmask = (
-            self.get_grammar_bitmask(
-                scheduled_new_reqs + scheduled_running_reqs,
-                scheduled_spec_decode_tokens))
-
         # Calculate the dummy block index.
         if self.cache_config.enable_prefix_caching:
             num_decode_reqs = len(scheduled_running_reqs)
-            if num_decode_reqs > 0 and \
-                num_decode_reqs < self.max_num_running_reqs:
+            if (num_decode_reqs > 0
+                    and num_decode_reqs < self.max_num_running_reqs):
                 dummy_block = self.kv_cache_manager.get_dummy_block()
+
+        # Record the request ids that were scheduled in this step.
+        self.prev_step_scheduled_req_ids.clear()
+        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         scheduler_output = RBLNSchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -450,14 +458,14 @@ class RBLNOptimumScheduler(Scheduler):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=None,
             num_common_prefix_blocks=num_common_prefix_blocks,
+            preempted_req_ids={req.request_id
+                               for req in preempted_reqs},
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=[],
-            structured_output_request_ids=structured_output_request_ids,
-            grammar_bitmask=grammar_bitmask,
             block_table_dict=block_table_dict,
             cached_block_table=cached_block_table,
             cached_length=cached_length,

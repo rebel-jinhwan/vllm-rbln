@@ -34,12 +34,18 @@ def test_structured_output():
 
     # Prefill 1st request
     scheduler_output = scheduler.schedule()
-    assert len(scheduler_output.structured_output_request_ids) == 1
-    assert len(scheduler_output.grammar_bitmask) == 1
+    grammar_output = scheduler.get_grammar_bitmask(scheduler_output)
+    assert grammar_output is not None
+    assert len(grammar_output.structured_output_request_ids) == 1
+    assert len(grammar_output.grammar_bitmask) == 1
     # Prefill 2nd request
     scheduler_output = scheduler.schedule()
-    assert len(scheduler_output.structured_output_request_ids) == 1
-    assert len(scheduler_output.grammar_bitmask) == 1
+    grammar_output = scheduler.get_grammar_bitmask(scheduler_output)
+    assert grammar_output is not None
+    assert len(grammar_output.structured_output_request_ids) == 1
+    assert len(grammar_output.grammar_bitmask) == 1
     # Decode step for both requests
     scheduler_output = scheduler.schedule()
-    assert len(scheduler_output.structured_output_request_ids) == 2
+    grammar_output = scheduler.get_grammar_bitmask(scheduler_output)
+    assert grammar_output is not None
+    assert len(grammar_output.structured_output_request_ids) == 2
