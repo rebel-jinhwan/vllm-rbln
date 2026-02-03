@@ -25,7 +25,6 @@ else:
     VllmConfig = None
 
 import rebel
-from torch._dynamo import register_backend
 from vllm.platforms import Platform, PlatformEnum
 from vllm.utils.torch_utils import _StreamPlaceholder
 
@@ -37,13 +36,6 @@ from vllm_rbln.utils.optimum.registry import (is_enc_dec_arch, is_multi_modal,
                                               is_pooling_arch)
 
 logger = init_logger(__name__)
-
-
-def bypass_backend(graph_module: torch.fx.GraphModule, example_inputs):
-    return graph_module.forward
-
-
-register_backend(name="bypass", compiler_fn=bypass_backend)
 
 
 class RblnPlatform(Platform):
@@ -58,13 +50,29 @@ class RblnPlatform(Platform):
     device_type: str = "cpu"
     dispatch_key: str = "CPU"
     ray_device_key: str = "RBLN"
-    simple_compile_backend = "bypass"
+    simple_compile_backend = "eager"
     device_control_env_var: str = "RBLN_DEVICES"
     current_stream = _StreamPlaceholder
 
     @classmethod
     def import_kernels(cls) -> None:
         pass
+
+    @classmethod
+    def get_compile_backend(cls) -> str:
+        """Return the vLLM compilation backend for RBLN.
+
+        RBLN does not use vLLM's piecewise compilation pipeline
+        (CompilationMode is forced to NONE in check_and_update_config),
+        so the built-in "eager" backend — a no-op CompilerInterface
+        adaptor — is the correct choice.
+
+        The actual model compilation for RBLN happens independently
+        via ``torch.compile(backend="rbln")`` in the model runners.
+
+        Upstream reference: vllm-project/vllm#28623
+        """
+        return "eager"
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -130,11 +138,13 @@ class RblnPlatform(Platform):
             else:
                 dtype = model_config.dtype
                 logger.info("original model_config.dtype = %s", dtype)
-                if dtype != torch.bfloat16 and dtype != torch.float16 \
-                            and dtype != torch.float:
+                if (dtype != torch.bfloat16 and dtype != torch.float16
+                        and dtype != torch.float):
                     logger.warning(
                         "%s not supported on RBLN, "
-                        "only fp32,fp16,bf16 supported", dtype)
+                        "only fp32,fp16,bf16 supported",
+                        dtype,
+                    )
                     model_config.dtype = torch.float
                 logger.info("RBLN use model_config.dtype = %s",
                             model_config.dtype)
@@ -148,13 +158,13 @@ class RblnPlatform(Platform):
             # FIXME(jiwoo.park) This is a temporary workaround.
             if model_config.enforce_eager:
                 hf_config = vllm_config.model_config.hf_config
-                assert not hasattr(hf_config, "sliding_window") \
-                    or not getattr(hf_config, "use_sliding_window", True)
+                assert not hasattr(hf_config, "sliding_window") or not getattr(
+                    hf_config, "use_sliding_window", True)
 
                 RblnPlatform.device_type = "rbln"
                 vllm_config.device_config.device_type = RblnPlatform.device_type
-                vllm_config.device_config.device = (torch.device(
-                    RblnPlatform.device_type))
+                vllm_config.device_config.device = torch.device(
+                    RblnPlatform.device_type)
                 # NOTE - force dtype into fp16 for eager mode
                 model_config.dtype = torch.float16
 
@@ -169,10 +179,10 @@ class RblnPlatform(Platform):
             assert model_config.dtype == torch.float
 
             if parallel_config.worker_cls == "auto":
-                parallel_config.worker_cls = \
-                    "vllm_rbln.v1.worker.optimum_worker.RBLNOptimumWorker"
-            scheduler_config.scheduler_cls = \
-                "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler"
+                parallel_config.worker_cls = (
+                    "vllm_rbln.v1.worker.optimum_worker.RBLNOptimumWorker")
+            scheduler_config.scheduler_cls = (
+                "vllm_rbln.v1.core.optimum_scheduler.RBLNOptimumScheduler")
 
             assert vllm_config.parallel_config.tensor_parallel_size == 1, (
                 "Tensor parallelism is set when compiled in optimum-rbln.")
@@ -232,7 +242,9 @@ class RblnPlatform(Platform):
         """Disable prefix caching with warning message."""
         logger.warning(
             "Prefix caching is not available for %s. "
-            "It has been automatically disabled.", reason)
+            "It has been automatically disabled.",
+            reason,
+        )
         vllm_config.cache_config.enable_prefix_caching = False
 
     @classmethod
@@ -244,8 +256,9 @@ class RblnPlatform(Platform):
         hf_config = vllm_config.model_config.hf_config
 
         if envs.VLLM_RBLN_USE_VLLM_MODEL:
-            if getattr(hf_config, "sliding_window", None) is not None \
-                   and getattr(hf_config, "use_sliding_window", True):
+            if getattr(hf_config,
+                       "sliding_window", None) is not None and getattr(
+                           hf_config, "use_sliding_window", True):
                 cls._disable_prefix_caching(vllm_config,
                                             "sliding window models")
 
@@ -262,8 +275,9 @@ class RblnPlatform(Platform):
                 cls._disable_prefix_caching(vllm_config, "multimodal models")
             elif is_pooling_arch(hf_config):
                 cls._disable_prefix_caching(vllm_config, "pooling models")
-            elif getattr(hf_config, "sliding_window", None) is not None \
-                    and getattr(hf_config, "use_sliding_window", True):
+            elif getattr(hf_config,
+                         "sliding_window", None) is not None and getattr(
+                             hf_config, "use_sliding_window", True):
                 cls._disable_prefix_caching(vllm_config,
                                             "sliding window models")
 
