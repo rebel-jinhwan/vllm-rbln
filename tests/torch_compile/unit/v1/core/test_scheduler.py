@@ -409,3 +409,182 @@ def test_spec_decode_cap_prefill_triggers_no_mixed_batching():
     assert len(sched_out.scheduled_new_reqs) == 1
     assert req_a.request_id not in sched_out.num_scheduled_tokens
     assert req_b.request_id in sched_out.num_scheduled_tokens
+
+
+# ===========================================================================
+# Tests: is_prefill helper
+# ===========================================================================
+
+
+def test_is_prefill():
+    """Test the is_prefill helper function."""
+    from vllm_rbln.v1.core.rbln_scheduler import is_prefill
+
+    req = create_requests(num_requests=1, num_tokens=10)[0]
+    # Initially num_computed_tokens=0, num_tokens=10 -> prefill
+    assert is_prefill(req) is True
+
+    req.num_computed_tokens = 8
+    assert is_prefill(req) is True
+
+    req.num_computed_tokens = 9
+    assert is_prefill(req) is False
+
+
+# ===========================================================================
+# Tests: long_prefill_token_threshold
+# ===========================================================================
+
+
+def test_long_prefill_token_threshold():
+    """When long_prefill_token_threshold is set, prefill tokens are limited."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        long_prefill_token_threshold=100,
+    )
+    req = create_requests(num_requests=1, num_tokens=500)[0]
+    scheduler.add_request(req)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[req.request_id] == 100
+
+
+# ===========================================================================
+# Tests: finish requests and verify cleanup
+# ===========================================================================
+
+
+def test_request_finish():
+    """Requests that reach max_tokens are finished and removed from running."""
+    scheduler = create_scheduler(max_num_batched_tokens=256)
+    req = create_requests(num_requests=1, num_tokens=10, max_tokens=1)[0]
+    scheduler.add_request(req)
+
+    # Prefill
+    output = scheduler.schedule()
+    model_output = create_runner_output(output, 1)
+    scheduler.update_from_output(output, model_output)
+
+    # After max_tokens reached, request should be finished
+    output = scheduler.schedule()
+    model_output = create_runner_output(output, 2)
+    scheduler.update_from_output(output, model_output)
+
+    # Check that the request has been finished
+    output = scheduler.schedule()
+    assert req.request_id in output.finished_req_ids or len(scheduler.running) == 0
+
+
+# ===========================================================================
+# Tests: multiple waiting requests scheduled in order
+# ===========================================================================
+
+
+def test_waiting_requests_order():
+    """Waiting requests are scheduled FCFS, one prefill per step."""
+    scheduler = create_scheduler()
+    reqs = create_requests(num_requests=3, num_tokens=10)
+    for r in reqs:
+        scheduler.add_request(r)
+
+    # Each step should schedule exactly one new prefill
+    for i in range(3):
+        output = scheduler.schedule()
+        assert len(output.scheduled_new_reqs) == 1
+        assert output.scheduled_new_reqs[0].req_id == reqs[i].request_id
+        model_output = create_runner_output(output, 0)
+        scheduler.update_from_output(output, model_output)
+
+
+# ===========================================================================
+# Tests: preemption and resume
+# ===========================================================================
+
+
+def test_max_num_seqs_limit():
+    """Once max_num_seqs requests are running, no more waiting requests
+    are scheduled until existing requests finish."""
+    max_seqs = 4
+    scheduler = create_scheduler(max_num_seqs=max_seqs)
+    reqs = create_requests(num_requests=max_seqs + 2, num_tokens=10)
+    for r in reqs:
+        scheduler.add_request(r)
+
+    # Prefill max_seqs requests
+    for _ in range(max_seqs):
+        out = scheduler.schedule()
+        scheduler.update_from_output(out, create_runner_output(out, 0))
+
+    assert len(scheduler.running) == max_seqs
+    assert len(scheduler.waiting) == 2
+
+    # Decode step: all running requests scheduled, no new ones
+    out = scheduler.schedule()
+    assert len(out.scheduled_new_reqs) == 0
+    assert out.scheduled_cached_reqs.num_reqs == max_seqs
+
+
+# ===========================================================================
+# Tests: speculative decoding with num_speculative_tokens
+# ===========================================================================
+
+
+def test_schedule_with_spec_decode():
+    """Basic spec decode flow: prefill, then decode with spec tokens."""
+    scheduler = create_scheduler(num_speculative_tokens=4)
+    req = create_requests(num_requests=1, num_tokens=50, max_tokens=100)[0]
+    scheduler.add_request(req)
+
+    # Prefill
+    out = scheduler.schedule()
+    assert len(out.scheduled_new_reqs) == 1
+    scheduler.update_from_output(out, create_runner_output(out, 1))
+
+    # Decode without spec tokens (no draft yet)
+    out = scheduler.schedule()
+    assert out.scheduled_cached_reqs.num_reqs == 1
+    assert out.num_scheduled_tokens[req.request_id] == 1
+
+
+# ===========================================================================
+# Tests: prefix caching with scheduler
+# ===========================================================================
+
+
+def test_schedule_with_prefix_caching():
+    """Requests with same prompt should benefit from prefix caching."""
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        block_size=16,
+        num_blocks=100,
+    )
+    reqs = create_requests(
+        num_requests=2,
+        num_tokens=32,
+        same_prompt=True,
+        block_size=16,
+    )
+
+    # Prefill first request
+    scheduler.add_request(reqs[0])
+    out = scheduler.schedule()
+    scheduler.update_from_output(out, create_runner_output(out, 0))
+
+    # Prefill second request - should benefit from prefix caching
+    scheduler.add_request(reqs[1])
+    out = scheduler.schedule()
+    assert len(out.scheduled_new_reqs) == 1
+
+
+# ===========================================================================
+# Tests: empty schedule (no requests)
+# ===========================================================================
+
+
+def test_empty_schedule():
+    """Schedule with no requests returns empty output."""
+    scheduler = create_scheduler()
+    out = scheduler.schedule()
+    assert out.total_num_scheduled_tokens == 0
+    assert len(out.scheduled_new_reqs) == 0
+    assert out.scheduled_cached_reqs.num_reqs == 0
