@@ -609,3 +609,625 @@ class TestEdgeCases:
         assert "self" in params
         assert "vllm_config" in params
         assert "device" in params
+
+
+# ===========================================================================
+# 6. _get_cumsum_and_arange – REAL code path
+# ===========================================================================
+
+
+class TestGetCumsumAndArange:
+    """Test RBLNModelRunner._get_cumsum_and_arange with real numpy arrays."""
+
+    def _call(self, num_tokens, cumsum_dtype=None, arange_size=10000):
+        stub = SimpleNamespace(arange_np=np.arange(arange_size, dtype=np.int64))
+        bound = types.MethodType(RBLNModelRunner._get_cumsum_and_arange, stub)
+        return bound(num_tokens, cumsum_dtype=cumsum_dtype)
+
+    def test_basic_example(self):
+        """Docstring example: [2, 5, 3] -> ([2, 7, 10], [0,1,0,1,2,3,4,0,1,2])."""
+        arr = np.array([2, 5, 3], dtype=np.int64)
+        cu, arange = self._call(arr)
+        np.testing.assert_array_equal(cu, [2, 7, 10])
+        np.testing.assert_array_equal(arange, [0, 1, 0, 1, 2, 3, 4, 0, 1, 2])
+
+    def test_single_element(self):
+        arr = np.array([4], dtype=np.int64)
+        cu, arange = self._call(arr)
+        np.testing.assert_array_equal(cu, [4])
+        np.testing.assert_array_equal(arange, [0, 1, 2, 3])
+
+    def test_all_ones(self):
+        arr = np.array([1, 1, 1], dtype=np.int64)
+        cu, arange = self._call(arr)
+        np.testing.assert_array_equal(cu, [1, 2, 3])
+        np.testing.assert_array_equal(arange, [0, 0, 0])
+
+    def test_cumsum_dtype(self):
+        arr = np.array([2, 3], dtype=np.int64)
+        cu, arange = self._call(arr, cumsum_dtype=np.int32)
+        assert cu.dtype == np.int32
+        np.testing.assert_array_equal(cu, [2, 5])
+
+    def test_large_values(self):
+        arr = np.array([100, 200], dtype=np.int64)
+        cu, arange = self._call(arr)
+        assert cu[-1] == 300
+        assert len(arange) == 300
+        # First segment: 0..99, second segment: 0..199
+        assert arange[0] == 0
+        assert arange[99] == 99
+        assert arange[100] == 0
+        assert arange[299] == 199
+
+    def test_two_elements(self):
+        arr = np.array([3, 2], dtype=np.int64)
+        cu, arange = self._call(arr)
+        np.testing.assert_array_equal(cu, [3, 5])
+        np.testing.assert_array_equal(arange, [0, 1, 2, 0, 1])
+
+
+# ===========================================================================
+# 7. is_prefills – REAL code path
+# ===========================================================================
+
+
+class TestIsPrefills:
+    """Test RBLNModelRunner.is_prefills with real numpy arrays."""
+
+    def _call(self, num_computed, num_tokens_no_spec):
+        stub = SimpleNamespace(
+            input_batch=SimpleNamespace(
+                num_computed_tokens_cpu=np.array(num_computed, dtype=np.int64),
+                num_tokens_no_spec=np.array(num_tokens_no_spec, dtype=np.int64),
+            )
+        )
+        bound = types.MethodType(RBLNModelRunner.is_prefills, stub)
+        return bound()
+
+    def test_all_prefill(self):
+        # computed < total - 1 means prefill
+        result = self._call([0, 0, 0], [10, 20, 30])
+        np.testing.assert_array_equal(result, [True, True, True])
+
+    def test_all_decode(self):
+        # computed >= total - 1 means decode
+        result = self._call([9, 19, 29], [10, 20, 30])
+        np.testing.assert_array_equal(result, [False, False, False])
+
+    def test_mixed(self):
+        result = self._call([0, 19], [10, 20])
+        np.testing.assert_array_equal(result, [True, False])
+
+    def test_boundary(self):
+        # num_computed == num_tokens - 2 => True (prefill)
+        # num_computed == num_tokens - 1 => False (decode)
+        result = self._call([8, 9], [10, 10])
+        np.testing.assert_array_equal(result, [True, False])
+
+
+# ===========================================================================
+# 8. use_wrapped_compute_logits – REAL code path
+# ===========================================================================
+
+
+class TestUseWrappedComputeLogits:
+    """Test RBLNModelRunner.use_wrapped_compute_logits with real logic."""
+
+    def test_no_lora_no_spec(self):
+        stub = SimpleNamespace(lora_config=None, speculative_config=None)
+        assert RBLNModelRunner.use_wrapped_compute_logits(stub) is True
+
+    def test_with_lora(self):
+        stub = SimpleNamespace(lora_config=MagicMock(), speculative_config=None)
+        assert RBLNModelRunner.use_wrapped_compute_logits(stub) is False
+
+    def test_with_eagle_spec(self):
+        stub = SimpleNamespace(
+            lora_config=None,
+            speculative_config=SimpleNamespace(method="eagle"),
+        )
+        assert RBLNModelRunner.use_wrapped_compute_logits(stub) is False
+
+    def test_with_eagle3_spec(self):
+        stub = SimpleNamespace(
+            lora_config=None,
+            speculative_config=SimpleNamespace(method="eagle3"),
+        )
+        assert RBLNModelRunner.use_wrapped_compute_logits(stub) is False
+
+    def test_with_non_eagle_spec(self):
+        stub = SimpleNamespace(
+            lora_config=None,
+            speculative_config=SimpleNamespace(method="ngram"),
+        )
+        assert RBLNModelRunner.use_wrapped_compute_logits(stub) is True
+
+    def test_lora_and_spec_both_set(self):
+        stub = SimpleNamespace(
+            lora_config=MagicMock(),
+            speculative_config=SimpleNamespace(method="eagle"),
+        )
+        assert RBLNModelRunner.use_wrapped_compute_logits(stub) is False
+
+
+# ===========================================================================
+# 9. _to_list – REAL code path
+# ===========================================================================
+
+
+class TestToList:
+    """Test RBLNModelRunner._to_list with real tensors."""
+
+    def _call(self, sampled_token_ids, pinned_size=16):
+        pinned = torch.zeros(pinned_size, 1, dtype=torch.long)
+        stub = SimpleNamespace(
+            sampled_token_ids_pinned_cpu=pinned,
+        )
+        bound = types.MethodType(RBLNModelRunner._to_list, stub)
+        return bound(sampled_token_ids)
+
+    def test_basic(self):
+        t = torch.tensor([[5], [10], [15]])
+        result = self._call(t)
+        assert result == [[5], [10], [15]]
+
+    def test_single(self):
+        t = torch.tensor([[42]])
+        result = self._call(t)
+        assert result == [[42]]
+
+    def test_preserves_values(self):
+        t = torch.tensor([[0], [1], [9999]])
+        result = self._call(t, pinned_size=8)
+        assert result == [[0], [1], [9999]]
+
+    def test_return_type_is_list_of_lists(self):
+        t = torch.tensor([[7], [8]])
+        result = self._call(t)
+        assert isinstance(result, list)
+        assert all(isinstance(r, list) for r in result)
+
+
+# ===========================================================================
+# 10. Bucketing – get_bucketing_manager factory (REAL calls)
+# ===========================================================================
+
+
+class TestGetBucketingManagerFactory:
+    """Test the get_bucketing_manager factory with REAL manager instantiation."""
+
+    def test_exponential_strategy(self):
+        from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = get_bucketing_manager(
+            "exponential", max_batch_size=32, min_batch_size=1, limit=8, step=2
+        )
+        assert isinstance(mgr, ExponentialBucketingManager)
+
+    def test_linear_strategy(self):
+        from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+        from vllm_rbln.v1.worker.bucketing.linear_bucketing_manager import (
+            LinearBucketingManager,
+        )
+
+        mgr = get_bucketing_manager(
+            "linear", max_batch_size=16, min_batch_size=1, limit=4, step=4
+        )
+        assert isinstance(mgr, LinearBucketingManager)
+
+    def test_manual_strategy(self):
+        from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+        from vllm_rbln.v1.worker.bucketing.manual_bucketing_manager import (
+            ManualBucketingManager,
+        )
+
+        mgr = get_bucketing_manager(
+            "manual", max_batch_size=8, manual_buckets=[2, 4, 8]
+        )
+        assert isinstance(mgr, ManualBucketingManager)
+
+    def test_invalid_strategy_raises(self):
+        from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+
+        with pytest.raises(ValueError, match="Invalid bucketing strategy"):
+            get_bucketing_manager("unknown", max_batch_size=8)
+
+    def test_manual_with_none_buckets_defaults_to_empty(self):
+        """When manual_buckets is None, it defaults to [] which triggers assertion."""
+        from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+
+        with pytest.raises(AssertionError):
+            get_bucketing_manager("manual", max_batch_size=8, manual_buckets=None)
+
+
+# ===========================================================================
+# 11. ExponentialBucketingManager – REAL decode bucket construction
+# ===========================================================================
+
+
+class TestExponentialBucketingManagerReal:
+    """Test ExponentialBucketingManager with REAL bucket construction."""
+
+    def test_buckets_are_sorted(self):
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = ExponentialBucketingManager(
+            max_batch_size=64, min_batch_size=1, limit=10, step=2
+        )
+        assert mgr.decode_batch_buckets == sorted(mgr.decode_batch_buckets)
+
+    def test_max_batch_size_always_in_buckets(self):
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = ExponentialBucketingManager(
+            max_batch_size=32, min_batch_size=1, limit=8, step=2
+        )
+        assert 32 in mgr.decode_batch_buckets
+
+    def test_batch_buckets_include_1_for_prefill(self):
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = ExponentialBucketingManager(
+            max_batch_size=16, min_batch_size=1, limit=4, step=2
+        )
+        assert 1 in mgr.batch_buckets
+
+    def test_exponential_division(self):
+        """max=32, step=2 -> 32, 16, 8, 4, 2, 1 (up to limit)."""
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = ExponentialBucketingManager(
+            max_batch_size=32, min_batch_size=1, limit=10, step=2
+        )
+        assert mgr.decode_batch_buckets == [1, 2, 4, 8, 16, 32]
+
+    def test_limit_caps_buckets(self):
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = ExponentialBucketingManager(
+            max_batch_size=64, min_batch_size=1, limit=3, step=2
+        )
+        # limit=3 -> only 3 buckets: 64, 32, 16
+        assert len(mgr.decode_batch_buckets) <= 3
+
+    def test_find_decode_batch_bucket_exact(self):
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = ExponentialBucketingManager(
+            max_batch_size=32, min_batch_size=1, limit=10, step=2
+        )
+        assert mgr.find_decode_batch_bucket(16) == 16
+
+    def test_find_decode_batch_bucket_rounds_up(self):
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = ExponentialBucketingManager(
+            max_batch_size=32, min_batch_size=1, limit=10, step=2
+        )
+        assert mgr.find_decode_batch_bucket(3) == 4
+
+    def test_find_decode_batch_bucket_overflow_raises(self):
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = ExponentialBucketingManager(
+            max_batch_size=8, min_batch_size=1, limit=4, step=2
+        )
+        with pytest.raises(ValueError):
+            mgr.find_decode_batch_bucket(9)
+
+    def test_step_1_raises(self):
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        with pytest.raises(ValueError, match="step must be greater than 1"):
+            ExponentialBucketingManager(
+                max_batch_size=8, min_batch_size=1, limit=4, step=1
+            )
+
+    def test_batch_buckets_count(self):
+        from vllm_rbln.v1.worker.bucketing.exponential_bucketing_manager import (
+            ExponentialBucketingManager,
+        )
+
+        mgr = ExponentialBucketingManager(
+            max_batch_size=32, min_batch_size=1, limit=10, step=2
+        )
+        # decode: [1, 2, 4, 8, 16, 32], batch includes prefill 1 too
+        assert mgr.batch_buckets_count == len(mgr.batch_buckets)
+        assert mgr.decode_batch_buckets_count == len(mgr.decode_batch_buckets)
+
+
+# ===========================================================================
+# 12. LinearBucketingManager – REAL decode bucket construction
+# ===========================================================================
+
+
+class TestLinearBucketingManagerReal:
+    """Test LinearBucketingManager with REAL bucket construction."""
+
+    def test_linear_subtraction(self):
+        from vllm_rbln.v1.worker.bucketing.linear_bucketing_manager import (
+            LinearBucketingManager,
+        )
+
+        mgr = LinearBucketingManager(
+            max_batch_size=16, min_batch_size=1, limit=10, step=4
+        )
+        # 16, 12, 8, 4 (next would be 0 < min=1, stop)
+        assert mgr.decode_batch_buckets == [4, 8, 12, 16]
+
+    def test_max_always_present(self):
+        from vllm_rbln.v1.worker.bucketing.linear_bucketing_manager import (
+            LinearBucketingManager,
+        )
+
+        mgr = LinearBucketingManager(
+            max_batch_size=20, min_batch_size=1, limit=5, step=5
+        )
+        assert 20 in mgr.decode_batch_buckets
+
+    def test_batch_buckets_include_1(self):
+        from vllm_rbln.v1.worker.bucketing.linear_bucketing_manager import (
+            LinearBucketingManager,
+        )
+
+        mgr = LinearBucketingManager(
+            max_batch_size=10, min_batch_size=1, limit=5, step=3
+        )
+        assert 1 in mgr.batch_buckets
+
+    def test_find_decode_batch_bucket(self):
+        from vllm_rbln.v1.worker.bucketing.linear_bucketing_manager import (
+            LinearBucketingManager,
+        )
+
+        mgr = LinearBucketingManager(
+            max_batch_size=16, min_batch_size=1, limit=10, step=4
+        )
+        assert mgr.find_decode_batch_bucket(5) == 8
+        assert mgr.find_decode_batch_bucket(4) == 4
+        assert mgr.find_decode_batch_bucket(16) == 16
+
+    def test_find_decode_batch_bucket_overflow(self):
+        from vllm_rbln.v1.worker.bucketing.linear_bucketing_manager import (
+            LinearBucketingManager,
+        )
+
+        mgr = LinearBucketingManager(
+            max_batch_size=16, min_batch_size=1, limit=10, step=4
+        )
+        with pytest.raises(ValueError):
+            mgr.find_decode_batch_bucket(17)
+
+    def test_limit_caps_buckets(self):
+        from vllm_rbln.v1.worker.bucketing.linear_bucketing_manager import (
+            LinearBucketingManager,
+        )
+
+        mgr = LinearBucketingManager(
+            max_batch_size=100, min_batch_size=1, limit=2, step=10
+        )
+        assert len(mgr.decode_batch_buckets) <= 2
+
+
+# ===========================================================================
+# 13. ManualBucketingManager – REAL decode bucket construction
+# ===========================================================================
+
+
+class TestManualBucketingManagerReal:
+    """Test ManualBucketingManager with REAL bucket construction."""
+
+    def test_basic(self):
+        from vllm_rbln.v1.worker.bucketing.manual_bucketing_manager import (
+            ManualBucketingManager,
+        )
+
+        mgr = ManualBucketingManager(max_batch_size=8, manual_buckets=[2, 4, 8])
+        assert mgr.decode_batch_buckets == [2, 4, 8]
+
+    def test_buckets_sorted(self):
+        from vllm_rbln.v1.worker.bucketing.manual_bucketing_manager import (
+            ManualBucketingManager,
+        )
+
+        mgr = ManualBucketingManager(max_batch_size=8, manual_buckets=[8, 2, 4])
+        assert mgr.decode_batch_buckets == [2, 4, 8]
+
+    def test_dedup(self):
+        from vllm_rbln.v1.worker.bucketing.manual_bucketing_manager import (
+            ManualBucketingManager,
+        )
+
+        mgr = ManualBucketingManager(max_batch_size=8, manual_buckets=[4, 4, 8])
+        assert mgr.decode_batch_buckets == [4, 8]
+
+    def test_last_must_equal_max_batch_size(self):
+        from vllm_rbln.v1.worker.bucketing.manual_bucketing_manager import (
+            ManualBucketingManager,
+        )
+
+        with pytest.raises(ValueError, match="last manual bucket must be equal"):
+            ManualBucketingManager(max_batch_size=16, manual_buckets=[2, 4, 8])
+
+    def test_empty_raises(self):
+        from vllm_rbln.v1.worker.bucketing.manual_bucketing_manager import (
+            ManualBucketingManager,
+        )
+
+        with pytest.raises(AssertionError):
+            ManualBucketingManager(max_batch_size=8, manual_buckets=[])
+
+    def test_find_decode_batch_bucket(self):
+        from vllm_rbln.v1.worker.bucketing.manual_bucketing_manager import (
+            ManualBucketingManager,
+        )
+
+        mgr = ManualBucketingManager(max_batch_size=8, manual_buckets=[2, 4, 8])
+        assert mgr.find_decode_batch_bucket(1) == 2
+        assert mgr.find_decode_batch_bucket(3) == 4
+        assert mgr.find_decode_batch_bucket(8) == 8
+
+    def test_batch_buckets_include_1(self):
+        from vllm_rbln.v1.worker.bucketing.manual_bucketing_manager import (
+            ManualBucketingManager,
+        )
+
+        mgr = ManualBucketingManager(max_batch_size=8, manual_buckets=[2, 4, 8])
+        assert 1 in mgr.batch_buckets
+
+
+# ===========================================================================
+# 14. RBLNBucketingManager.check_config – REAL validation
+# ===========================================================================
+
+
+class TestBucketingCheckConfig:
+    """Test RBLNBucketingManager.check_config with REAL validation logic."""
+
+    def test_valid_config(self):
+        from vllm_rbln.v1.worker.bucketing.bucketing_manager import RBLNBucketingManager
+
+        # Should not raise
+        RBLNBucketingManager.check_config(
+            max_batch_size=32, min_batch_size=1, limit=4, step=2
+        )
+
+    def test_max_less_than_min_raises(self):
+        from vllm_rbln.v1.worker.bucketing.bucketing_manager import RBLNBucketingManager
+
+        with pytest.raises(ValueError, match="max_batch_size must be >= min_batch_size"):
+            RBLNBucketingManager.check_config(
+                max_batch_size=1, min_batch_size=10, limit=4, step=2
+            )
+
+    def test_limit_zero_raises(self):
+        from vllm_rbln.v1.worker.bucketing.bucketing_manager import RBLNBucketingManager
+
+        with pytest.raises(ValueError, match="limit must be greater than 0"):
+            RBLNBucketingManager.check_config(
+                max_batch_size=32, min_batch_size=1, limit=0, step=2
+            )
+
+    def test_step_zero_raises(self):
+        from vllm_rbln.v1.worker.bucketing.bucketing_manager import RBLNBucketingManager
+
+        with pytest.raises(ValueError, match="step must be greater than 0"):
+            RBLNBucketingManager.check_config(
+                max_batch_size=32, min_batch_size=1, limit=4, step=0
+            )
+
+    def test_min_batch_size_zero_raises(self):
+        from vllm_rbln.v1.worker.bucketing.bucketing_manager import RBLNBucketingManager
+
+        with pytest.raises(ValueError, match="min_batch_size must be greater than 0"):
+            RBLNBucketingManager.check_config(
+                max_batch_size=32, min_batch_size=0, limit=4, step=2
+            )
+
+
+# ===========================================================================
+# 15. _may_reorder_batch – REAL code path with env override
+# ===========================================================================
+
+
+class TestMayReorderBatch:
+    """Test RBLNModelRunner._may_reorder_batch with REAL sorting logic."""
+
+    def test_no_reorder_when_env_disabled(self):
+        """When VLLM_RBLN_SORT_BATCH is False, no reordering occurs."""
+        stub = SimpleNamespace(
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
+            input_batch=SimpleNamespace(
+                req_ids=["a", "b", "c"],
+                num_tokens=np.array([10, 30, 20]),
+            ),
+        )
+        bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
+        with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+            mock_envs.VLLM_RBLN_SORT_BATCH = False
+            bound(MagicMock())
+        # num_tokens unchanged
+        np.testing.assert_array_equal(stub.input_batch.num_tokens, [10, 30, 20])
+
+    def test_no_reorder_when_no_kv_cache_groups(self):
+        """When kv_cache_groups is empty, no reordering occurs."""
+        stub = SimpleNamespace(
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+            input_batch=SimpleNamespace(
+                req_ids=["a", "b"],
+                num_tokens=np.array([5, 10]),
+            ),
+        )
+        bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
+        with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+            mock_envs.VLLM_RBLN_SORT_BATCH = True
+            bound(MagicMock())
+        np.testing.assert_array_equal(stub.input_batch.num_tokens, [5, 10])
+
+    def test_reorder_sorts_descending(self):
+        """When enabled and groups exist, reorder by descending num_tokens."""
+        swap_log = []
+
+        def mock_swap(src, dst):
+            swap_log.append((src, dst))
+            # Actually swap num_tokens to verify logic
+            arr = stub.input_batch.num_tokens
+            arr[src], arr[dst] = arr[dst], arr[src]
+
+        stub = SimpleNamespace(
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
+            input_batch=SimpleNamespace(
+                req_ids=["a", "b", "c"],
+                num_tokens=np.array([10, 30, 20]),
+                swap_states=mock_swap,
+            ),
+        )
+        bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
+        with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+            mock_envs.VLLM_RBLN_SORT_BATCH = True
+            bound(MagicMock())
+        # After sorting descending: [30, 20, 10]
+        np.testing.assert_array_equal(stub.input_batch.num_tokens, [30, 20, 10])
+
+    def test_already_sorted_no_swaps(self):
+        """If already sorted descending, no swaps needed."""
+        swap_log = []
+
+        def mock_swap(src, dst):
+            swap_log.append((src, dst))
+
+        stub = SimpleNamespace(
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[1]),
+            input_batch=SimpleNamespace(
+                req_ids=["a", "b", "c"],
+                num_tokens=np.array([30, 20, 10]),
+                swap_states=mock_swap,
+            ),
+        )
+        bound = types.MethodType(RBLNModelRunner._may_reorder_batch, stub)
+        with patch("vllm_rbln.v1.worker.rbln_model_runner.envs") as mock_envs:
+            mock_envs.VLLM_RBLN_SORT_BATCH = True
+            bound(MagicMock())
+        assert len(swap_log) == 0
