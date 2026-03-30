@@ -608,3 +608,552 @@ class TestEdgeCases:
         out = scheduler.schedule()
         assert len(out.scheduled_new_reqs) == 0
         assert out.scheduled_cached_reqs.num_reqs == max_seqs
+
+
+# ===========================================================================
+# 9. Long prefill threshold (chunked by threshold)
+# ===========================================================================
+
+
+class TestLongPrefillThreshold:
+    """Test long_prefill_token_threshold limits tokens per prefill step."""
+
+    def test_long_prefill_chunks_by_threshold(self):
+        """A prompt longer than the threshold is chunked to that threshold."""
+        threshold = 16
+        scheduler = create_scheduler(
+            long_prefill_token_threshold=threshold,
+            max_num_batched_tokens=8192,
+            block_size=16,
+            num_blocks=1000,
+        )
+        req = create_requests(num_requests=1, num_tokens=32, block_size=16)[0]
+        scheduler.add_request(req)
+
+        # First step: should schedule only threshold tokens
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == threshold
+        scheduler.update_from_output(out, create_runner_output(out))
+
+        # Second step: remaining tokens
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == 32 - threshold
+        scheduler.update_from_output(out, create_runner_output(out, 0))
+
+        # Third step: decode
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == 1
+
+    def test_threshold_zero_means_no_limit(self):
+        """Threshold of 0 means no chunking by threshold."""
+        scheduler = create_scheduler(
+            long_prefill_token_threshold=0,
+            max_num_batched_tokens=8192,
+            block_size=16,
+            num_blocks=1000,
+        )
+        req = create_requests(num_requests=1, num_tokens=64, block_size=16)[0]
+        scheduler.add_request(req)
+
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == 64
+
+    def test_threshold_larger_than_prompt_no_effect(self):
+        """When threshold > prompt length, all tokens scheduled at once."""
+        scheduler = create_scheduler(
+            long_prefill_token_threshold=100,
+            max_num_batched_tokens=8192,
+            block_size=16,
+            num_blocks=1000,
+        )
+        req = create_requests(num_requests=1, num_tokens=32, block_size=16)[0]
+        scheduler.add_request(req)
+
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == 32
+
+
+# ===========================================================================
+# 10. Waiting queue with budget exhaustion
+# ===========================================================================
+
+
+class TestWaitingQueueBudgetExhaustion:
+    """Submit many requests that exhaust token_budget; verify some stay waiting."""
+
+    def test_requests_stay_in_waiting_when_slots_full(self):
+        """With max_num_seqs=2, only 2 requests get scheduled; rest wait."""
+        scheduler = create_scheduler(max_num_seqs=2)
+        reqs = create_requests(num_requests=5, num_tokens=10)
+        for r in reqs:
+            scheduler.add_request(r)
+
+        # Prefill 2 requests (one per step)
+        for _ in range(2):
+            out = scheduler.schedule()
+            assert len(out.scheduled_new_reqs) == 1
+            scheduler.update_from_output(out, create_runner_output(out, 0))
+
+        assert len(scheduler.running) == 2
+        assert len(scheduler.waiting) == 3
+
+        # Decode step: no new requests can be added
+        out = scheduler.schedule()
+        assert len(out.scheduled_new_reqs) == 0
+        assert out.scheduled_cached_reqs.num_reqs == 2
+
+    def test_waiting_requests_scheduled_after_finish(self):
+        """After a running request finishes, a waiting request gets scheduled."""
+        scheduler = create_scheduler(max_num_seqs=1)
+        reqs = create_requests(num_requests=2, num_tokens=10, max_tokens=2)
+        for r in reqs:
+            scheduler.add_request(r)
+
+        # Prefill first request
+        out = scheduler.schedule()
+        assert out.scheduled_new_reqs[0].req_id == reqs[0].request_id
+        scheduler.update_from_output(out, create_runner_output(out, 100))
+
+        # Decode until first request finishes and second gets scheduled
+        found_second = False
+        for _ in range(10):
+            out = scheduler.schedule()
+            if len(out.scheduled_new_reqs) > 0:
+                assert out.scheduled_new_reqs[0].req_id == reqs[1].request_id
+                found_second = True
+                break
+            if out.total_num_scheduled_tokens == 0:
+                # Nothing scheduled, nothing to update
+                continue
+            scheduler.update_from_output(out, create_runner_output(out, 100))
+        assert found_second, "Second request was never scheduled"
+
+
+# ===========================================================================
+# 11. New request block allocation failure
+# ===========================================================================
+
+
+class TestNewRequestBlockAllocationFailure:
+    """Create scheduler with very limited blocks; verify allocation failure."""
+
+    def test_block_allocation_fails_with_limited_blocks(self):
+        """With very few blocks, a large request cannot be allocated."""
+        # 3 blocks total, block 0 is null -> 2 usable blocks = 32 tokens.
+        # A request with 48 tokens needs 3 blocks -> fails.
+        scheduler = create_scheduler(
+            max_num_batched_tokens=8192,
+            block_size=16,
+            num_blocks=3,
+            enable_prefix_caching=False,
+        )
+        req = create_requests(num_requests=1, num_tokens=48, block_size=16)[0]
+        scheduler.add_request(req)
+
+        out = scheduler.schedule()
+        # The request should not be scheduled since there aren't enough blocks
+        assert req.request_id not in out.num_scheduled_tokens
+        assert out.total_num_scheduled_tokens == 0
+        # Request stays in waiting
+        assert len(scheduler.waiting) == 1
+
+    def test_second_request_fails_when_blocks_exhausted(self):
+        """First request succeeds but second fails due to block exhaustion."""
+        # 5 blocks: 1 null + 4 usable = 64 tokens.
+        # First request: 48 tokens = 3 blocks. OK.
+        # Second request: 48 tokens = 3 blocks. Only 1 left -> fail.
+        scheduler = create_scheduler(
+            max_num_batched_tokens=8192,
+            block_size=16,
+            num_blocks=5,
+            enable_prefix_caching=False,
+        )
+        reqs = create_requests(num_requests=2, num_tokens=48, block_size=16)
+        for r in reqs:
+            scheduler.add_request(r)
+
+        # Prefill first request
+        out = scheduler.schedule()
+        assert reqs[0].request_id in out.num_scheduled_tokens
+        scheduler.update_from_output(out, create_runner_output(out, 0))
+
+        # Try to prefill second request - should fail
+        out = scheduler.schedule()
+        assert reqs[1].request_id not in out.num_scheduled_tokens
+        # Second request stays in waiting
+        assert len(scheduler.waiting) == 1
+
+
+# ===========================================================================
+# 12. Spec decode tokens
+# ===========================================================================
+
+
+class TestSpecDecodeTokens:
+    """Test spec_token_ids scheduling with block boundary constraints."""
+
+    _BLOCK_SIZE = 16
+    _NUM_BLOCKS = 1000
+
+    def _make_scheduler(self, **kwargs):
+        return create_scheduler(
+            block_size=self._BLOCK_SIZE,
+            num_blocks=self._NUM_BLOCKS,
+            max_num_seqs=16,
+            max_num_batched_tokens=8192,
+            **kwargs,
+        )
+
+    def test_spec_tokens_scheduled(self):
+        """Spec tokens that fit within the block are scheduled."""
+        scheduler = self._make_scheduler()
+        req = create_requests(
+            num_requests=1, num_tokens=16, block_size=self._BLOCK_SIZE,
+            max_tokens=100,
+        )[0]
+        scheduler.add_request(req)
+
+        # Prefill
+        out = scheduler.schedule()
+        scheduler.update_from_output(out, create_runner_output(out, 1))
+
+        # Now in decode. Set spec tokens. Position is at block boundary (16),
+        # so full block of space remains.
+        req.spec_token_ids = [10, 20, 30]
+        out = scheduler.schedule()
+
+        assert out.num_scheduled_tokens[req.request_id] == 4  # 1 decode + 3 spec
+        assert req.request_id in out.scheduled_spec_decode_tokens
+        assert out.scheduled_spec_decode_tokens[req.request_id] == [10, 20, 30]
+
+    def test_spec_tokens_trimmed_at_block_boundary(self):
+        """Spec tokens that would cross block boundary are trimmed."""
+        scheduler = self._make_scheduler()
+        # Prompt of 15 tokens. After prefill, num_computed_tokens = 15.
+        # After 1 output token appended, num_tokens = 16.
+        # At next schedule: remaining_in_block = 16 - (15 % 16) = 1.
+        # With 3 spec tokens: 4 new tokens requested but cap=1, so only 1 scheduled.
+        req = create_requests(
+            num_requests=1, num_tokens=15, block_size=self._BLOCK_SIZE,
+            max_tokens=100,
+        )[0]
+        scheduler.add_request(req)
+
+        # Prefill: num_computed_tokens set to 15 after _update_after_schedule
+        out = scheduler.schedule()
+        scheduler.update_from_output(out, create_runner_output(out, 1))
+
+        # Now: num_computed_tokens=15, num_tokens=16
+        # Set spec tokens before next schedule
+        req.spec_token_ids = [10, 20, 30]
+        out = scheduler.schedule()
+
+        # remaining_in_block = 16 - 15 = 1, so only 1 token scheduled
+        assert out.num_scheduled_tokens[req.request_id] == 1
+        assert req.request_id not in out.scheduled_spec_decode_tokens
+
+    def test_spec_tokens_cleared_after_scheduling(self):
+        """After scheduling, spec_token_ids on the request is cleared."""
+        scheduler = self._make_scheduler()
+        req = create_requests(
+            num_requests=1, num_tokens=16, block_size=self._BLOCK_SIZE,
+            max_tokens=100,
+        )[0]
+        scheduler.add_request(req)
+
+        out = scheduler.schedule()
+        scheduler.update_from_output(out, create_runner_output(out, 1))
+
+        req.spec_token_ids = [10, 20]
+        out = scheduler.schedule()
+
+        # spec_token_ids should be cleared on the request after scheduling
+        assert req.spec_token_ids == []
+
+
+# ===========================================================================
+# 13. Multiple decode steps
+# ===========================================================================
+
+
+class TestMultipleDecodeSteps:
+    """Run several decode cycles to exercise the running request loop."""
+
+    def test_multiple_decode_cycles(self):
+        """Run 10 decode steps with multiple requests."""
+        scheduler = create_scheduler(max_num_seqs=4)
+        reqs = create_requests(num_requests=4, num_tokens=10, max_tokens=20)
+        for r in reqs:
+            scheduler.add_request(r)
+
+        # Prefill all 4 (one per step)
+        for _ in range(4):
+            out = scheduler.schedule()
+            assert len(out.scheduled_new_reqs) == 1
+            scheduler.update_from_output(out, create_runner_output(out, 0))
+
+        assert len(scheduler.running) == 4
+
+        # Run 10 decode steps
+        for step in range(10):
+            out = scheduler.schedule()
+            assert out.scheduled_cached_reqs.num_reqs == 4
+            assert all(n == 1 for n in out.num_scheduled_tokens.values())
+            scheduler.update_from_output(out, create_runner_output(out, step + 100))
+
+    def test_decode_until_completion(self):
+        """Run decode until requests complete (max_tokens reached)."""
+        scheduler = create_scheduler(max_num_seqs=2)
+        reqs = create_requests(num_requests=2, num_tokens=10, max_tokens=3)
+        for r in reqs:
+            scheduler.add_request(r)
+
+        # Prefill both
+        for _ in range(2):
+            out = scheduler.schedule()
+            scheduler.update_from_output(out, create_runner_output(out, 0))
+
+        # Decode until finished
+        finished_count = 0
+        for _ in range(10):
+            out = scheduler.schedule()
+            if out.total_num_scheduled_tokens == 0:
+                break
+            scheduler.update_from_output(out, create_runner_output(out, 0))
+            finished_count += len(out.finished_req_ids)
+
+        # All requests should eventually finish
+        assert len(scheduler.running) == 0
+
+
+# ===========================================================================
+# 14. Paused state
+# ===========================================================================
+
+
+class TestPausedState:
+    """Set pause state and verify scheduling behavior."""
+
+    def test_paused_all_schedules_nothing(self):
+        """When PAUSED_ALL, token_budget=0 so nothing is scheduled."""
+        from vllm.v1.core.sched.interface import PauseState
+
+        scheduler = create_scheduler()
+        reqs = create_requests(num_requests=3, num_tokens=10)
+        for r in reqs:
+            scheduler.add_request(r)
+
+        # Prefill one request first
+        out = scheduler.schedule()
+        scheduler.update_from_output(out, create_runner_output(out, 0))
+        assert len(scheduler.running) == 1
+
+        # Pause
+        scheduler.set_pause_state(PauseState.PAUSED_ALL)
+
+        # Schedule should produce nothing
+        out = scheduler.schedule()
+        assert out.total_num_scheduled_tokens == 0
+        assert len(out.scheduled_new_reqs) == 0
+        assert out.scheduled_cached_reqs.num_reqs == 0
+
+    def test_unpause_resumes_scheduling(self):
+        """After unpausing, scheduling resumes normally."""
+        from vllm.v1.core.sched.interface import PauseState
+
+        scheduler = create_scheduler()
+        reqs = create_requests(num_requests=2, num_tokens=10)
+        for r in reqs:
+            scheduler.add_request(r)
+
+        # Pause before any scheduling
+        scheduler.set_pause_state(PauseState.PAUSED_ALL)
+        out = scheduler.schedule()
+        assert out.total_num_scheduled_tokens == 0
+
+        # Unpause
+        scheduler.set_pause_state(PauseState.UNPAUSED)
+        out = scheduler.schedule()
+        assert out.total_num_scheduled_tokens > 0
+        assert len(out.scheduled_new_reqs) == 1
+
+    def test_paused_all_with_running_requests(self):
+        """PAUSED_ALL prevents even running decode requests from being scheduled."""
+        from vllm.v1.core.sched.interface import PauseState
+
+        scheduler = create_scheduler()
+        reqs = create_requests(num_requests=2, num_tokens=10)
+        for r in reqs:
+            scheduler.add_request(r)
+
+        # Prefill both
+        for _ in range(2):
+            out = scheduler.schedule()
+            scheduler.update_from_output(out, create_runner_output(out, 0))
+
+        assert len(scheduler.running) == 2
+
+        # Pause
+        scheduler.set_pause_state(PauseState.PAUSED_ALL)
+        out = scheduler.schedule()
+        assert out.total_num_scheduled_tokens == 0
+        assert out.scheduled_cached_reqs.num_reqs == 0
+
+
+# ===========================================================================
+# 15. SchedulerOutput construction fields
+# ===========================================================================
+
+
+class TestSchedulerOutputFields:
+    """Verify SchedulerOutput has all expected fields populated."""
+
+    def test_output_fields_on_prefill(self):
+        """Check all fields of SchedulerOutput during prefill."""
+        scheduler = create_scheduler()
+        req = create_requests(num_requests=1, num_tokens=10)[0]
+        scheduler.add_request(req)
+
+        out = scheduler.schedule()
+
+        # Basic fields
+        assert out.total_num_scheduled_tokens == 10
+        assert len(out.scheduled_new_reqs) == 1
+        assert out.scheduled_new_reqs[0].req_id == req.request_id
+        assert out.scheduled_cached_reqs.num_reqs == 0
+        assert out.num_scheduled_tokens[req.request_id] == 10
+        assert isinstance(out.num_common_prefix_blocks, list)
+        assert isinstance(out.preempted_req_ids, set)
+        assert isinstance(out.finished_req_ids, set)
+        assert out.scheduled_spec_decode_tokens == {}
+        assert out.scheduled_encoder_inputs == {}
+
+    def test_output_fields_on_decode(self):
+        """Check all fields of SchedulerOutput during decode."""
+        scheduler = create_scheduler()
+        req = create_requests(num_requests=1, num_tokens=10)[0]
+        scheduler.add_request(req)
+
+        out = scheduler.schedule()
+        scheduler.update_from_output(out, create_runner_output(out, 0))
+
+        out = scheduler.schedule()
+        assert out.total_num_scheduled_tokens == 1
+        assert len(out.scheduled_new_reqs) == 0
+        assert out.scheduled_cached_reqs.num_reqs == 1
+        assert out.num_scheduled_tokens[req.request_id] == 1
+
+    def test_output_finished_req_ids(self):
+        """Finished request IDs appear in the output after completion."""
+        scheduler = create_scheduler()
+        req = create_requests(num_requests=1, num_tokens=10, max_tokens=3)[0]
+        scheduler.add_request(req)
+
+        # Prefill
+        out = scheduler.schedule()
+        scheduler.update_from_output(out, create_runner_output(out, 100))
+
+        # Decode until finished
+        finished_seen = False
+        for _ in range(10):
+            out = scheduler.schedule()
+            if req.request_id in out.finished_req_ids:
+                finished_seen = True
+                break
+            if out.total_num_scheduled_tokens == 0:
+                break
+            scheduler.update_from_output(out, create_runner_output(out, 100))
+
+        assert finished_seen, "Request was never reported as finished"
+
+
+# ===========================================================================
+# 16. Chunked prefill token alignment
+# ===========================================================================
+
+
+class TestChunkedPrefillTokenAlignment:
+    """Test chunked prefill with token budget constraints."""
+
+    def test_chunked_prefill_respects_budget(self):
+        """Chunked prefill allocates exactly the token budget per step."""
+        budget = 32
+        scheduler = create_scheduler(
+            max_num_batched_tokens=budget,
+            block_size=16,
+            num_blocks=1000,
+        )
+        # Use 64 tokens so it divides evenly into 2 chunks of 32
+        req = create_requests(num_requests=1, num_tokens=64, block_size=16)[0]
+        scheduler.add_request(req)
+
+        # First chunk
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == budget
+        scheduler.update_from_output(out, create_runner_output(out))
+
+        # Second chunk
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == budget
+        scheduler.update_from_output(out, create_runner_output(out, 0))
+
+        # After full prefill, decode step
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens[req.request_id] == 1
+
+    def test_chunked_prefill_with_threshold_and_budget(self):
+        """When both threshold and budget limit tokens, the smaller wins."""
+        scheduler = create_scheduler(
+            max_num_batched_tokens=64,
+            long_prefill_token_threshold=20,
+            block_size=16,
+            num_blocks=1000,
+        )
+        req = create_requests(num_requests=1, num_tokens=100, block_size=16)[0]
+        scheduler.add_request(req)
+
+        out = scheduler.schedule()
+        # threshold=20 < budget=64, so threshold wins
+        assert out.num_scheduled_tokens[req.request_id] == 20
+
+
+# ===========================================================================
+# 17. Preemption with FCFS policy under memory pressure
+# ===========================================================================
+
+
+class TestPreemptionFCFS:
+    """Test FCFS preemption when running requests can't allocate blocks."""
+
+    def test_fcfs_preemption_under_memory_pressure(self):
+        """Under FCFS with tight blocks, decode triggers preemption when a new
+        block is needed but none are free."""
+        # 8 blocks: 1 null + 7 usable.
+        # 2 requests of 48 tokens = 3 blocks each = 6 blocks used. 1 free.
+        # After prefill + 1 output token, num_computed=48+1=49 -> needs 4th block.
+        # First request gets the 1 free block. Second needs a block -> preemption.
+        scheduler = create_scheduler(
+            max_num_batched_tokens=8192,
+            block_size=16,
+            num_blocks=8,
+            enable_prefix_caching=False,
+            max_num_seqs=4,
+        )
+        reqs = create_requests(
+            num_requests=2, num_tokens=48, block_size=16, max_tokens=50
+        )
+        for r in reqs:
+            scheduler.add_request(r)
+
+        # Prefill both (one per step)
+        for _ in range(2):
+            out = scheduler.schedule()
+            scheduler.update_from_output(out, create_runner_output(out, 0))
+
+        assert len(scheduler.running) == 2
+
+        # Decode step: each request at position 48, needs block 4.
+        # Only 1 free block -> first request gets it, second is preempted.
+        out = scheduler.schedule()
+        assert len(out.preempted_req_ids) == 1
+        assert len(scheduler.running) == 1
