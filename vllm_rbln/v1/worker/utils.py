@@ -25,7 +25,9 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 import numpy as np
 import torch
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
+from vllm.distributed.parallel_state import TensorMetadata, get_pp_group
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.sequence import IntermediateTensors
 from vllm.utils.cpu_resource_utils import (
     LogicalCPUInfo,
     get_allowed_cpu_list,
@@ -50,6 +52,7 @@ from vllm_rbln.v1.worker.kv_placement import ChipletMemory, Unit
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
+
 
 logger = init_logger(__name__)
 
@@ -1053,6 +1056,95 @@ def reorder_input_batch(input_batch: "InputBatch", perm: np.ndarray) -> None:
         ib.allowed_token_ids_mask_cpu_tensor[:n] = ib.allowed_token_ids_mask_cpu_tensor[
             p
         ]
+
+
+def get_or_create_intermediate_tensors(
+    cache: dict[tuple[int, int], "IntermediateTensors"],
+    model: torch.nn.Module,
+    num_reqs_padded: int,
+    query_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> "IntermediateTensors":
+    """The PP hand-off buffers for one staged shape, created on first use and
+    reused after so the compiled graph keeps a fixed input address."""
+    key = (num_reqs_padded, query_len)
+    if (tensors := cache.get(key)) is None:
+        empty = model.make_empty_intermediate_tensors(
+            batch_size=num_reqs_padded * query_len, dtype=dtype, device=device
+        )
+        tensors = IntermediateTensors(
+            {name: t.view(num_reqs_padded, query_len, -1) for name, t in empty.items()}
+        )
+        cache[key] = tensors
+    return tensors
+
+
+def recv_intermediate_tensors(
+    cache: dict[tuple[int, int], "IntermediateTensors"],
+    model: torch.nn.Module,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> "IntermediateTensors":
+    """Receive the previous PP stage's output into this stage's buffers.
+
+    Like GroupCoordinator.recv_tensor_dict, except that upstream allocates a
+    fresh tensor on every call while this reuses the per-shape buffers of
+    `get_or_create_intermediate_tensors`."""
+    pp_group = get_pp_group()
+    src = (pp_group.rank_in_group - 1) % pp_group.world_size
+
+    recv_metadata_list: list[tuple[str, Any]] = pp_group.recv_object(src=src)
+    for name, meta in recv_metadata_list:
+        assert isinstance(meta, TensorMetadata), (
+            f"intermediate {name!r} is not a tensor: {meta!r}"
+        )
+
+    num_reqs_padded, query_len = (int(d) for d in recv_metadata_list[0][1].size[:2])
+    intermediate_tensors = get_or_create_intermediate_tensors(
+        cache, model, num_reqs_padded, query_len, dtype, device
+    )
+    received = [
+        (name, tuple(meta.size), meta.dtype) for name, meta in recv_metadata_list
+    ]
+    expected = [
+        (name, tuple(t.shape), t.dtype) for name, t in intermediate_tensors.items()
+    ]
+    assert received == expected, (
+        f"previous stage sent {received}, this stage expects {expected}"
+    )
+
+    group = (
+        pp_group.cpu_group if device == torch.device("cpu") else pp_group.device_group
+    )
+    handles = [
+        torch.distributed.irecv(
+            intermediate_tensors[name], src=pp_group.ranks[src], group=group
+        )
+        for name, _ in recv_metadata_list
+    ]
+    for handle in handles:
+        handle.wait()
+    return intermediate_tensors
+
+
+def make_weights_contiguous(*models: torch.nn.Module) -> None:
+    """Force weights contiguous before weight-free compile, which hard-errors
+    on non-contiguous CPU tensors. Covers parameters, buffers, and plain
+    tensor attributes."""
+
+    def model_tensors(model: torch.nn.Module):
+        yield from model.parameters()
+        yield from model.buffers()
+        for module in model.modules():
+            for value in module.__dict__.values():
+                if isinstance(value, torch.Tensor):
+                    yield value
+
+    for model in models:
+        for t in model_tensors(model):
+            if not t.is_contiguous():
+                t.data = t.data.contiguous()
 
 
 def get_kv_cache_names(

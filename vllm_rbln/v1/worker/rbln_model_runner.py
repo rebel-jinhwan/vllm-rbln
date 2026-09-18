@@ -28,7 +28,7 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
-from vllm.distributed.parallel_state import TensorMetadata, get_pp_group
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
@@ -167,7 +167,10 @@ from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager, StagedMod
 from vllm_rbln.v1.worker.utils import (
     copy_host_device_kv_blocks,
     get_kv_cache_names,
+    get_or_create_intermediate_tensors,
+    make_weights_contiguous,
     prepare_kernel_block_sizes,
+    recv_intermediate_tensors,
     reorder_input_batch,
 )
 from vllm_rbln.v1.worker.utils import (
@@ -1634,73 +1637,22 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
     def _create_or_get_intermediate_tensors(
         self, num_reqs_padded: int, query_len: int
     ) -> IntermediateTensors:
-        """
-        Create a new IntermediateTensors, or reuse an existing one if a matching
-        shape is already created.
-        """
-
-        key = (num_reqs_padded, query_len)
-        if (tensors := self.intermediate_tensors_dict.get(key)) is None:
-            empty = self.model.make_empty_intermediate_tensors(
-                batch_size=num_reqs_padded * query_len,
-                dtype=self.model_config.dtype,
-                device=self.device,
-            )
-            tensors = IntermediateTensors(
-                {
-                    name: t.view(num_reqs_padded, query_len, -1)
-                    for name, t in empty.items()
-                }
-            )
-            self.intermediate_tensors_dict[key] = tensors
-        return tensors
+        return get_or_create_intermediate_tensors(
+            self.intermediate_tensors_dict,
+            self.model,
+            num_reqs_padded,
+            query_len,
+            self.model_config.dtype,
+            self.device,
+        )
 
     def recv_intermediate_tensors(self) -> IntermediateTensors:
-        """Receive the previous PP stage's output into this stage's tensors.
-
-        NOTE(RBLN): this is essentially the same as GroupCoordinator.recv_tensor_dict,
-        except that the upstream version allocates a new empty tensor on every call.
-        Here we instead reuse buffers via _create_or_get_intermediate_tensors, keeping
-        the graph input pinned to a fixed tensor.
-        """
-        pp_group = get_pp_group()
-        src = (pp_group.rank_in_group - 1) % pp_group.world_size
-
-        recv_metadata_list: list[tuple[str, Any]] = pp_group.recv_object(src=src)
-        for name, meta in recv_metadata_list:
-            assert isinstance(meta, TensorMetadata), (
-                f"intermediate {name!r} is not a tensor: {meta!r}"
-            )
-
-        num_reqs_padded, query_len = (int(d) for d in recv_metadata_list[0][1].size[:2])
-        intermediate_tensors = self._create_or_get_intermediate_tensors(
-            num_reqs_padded, query_len
+        return recv_intermediate_tensors(
+            self.intermediate_tensors_dict,
+            self.model,
+            self.model_config.dtype,
+            self.device,
         )
-        received = [
-            (name, tuple(meta.size), meta.dtype) for name, meta in recv_metadata_list
-        ]
-        expected = [
-            (name, tuple(t.shape), t.dtype) for name, t in intermediate_tensors.items()
-        ]
-        assert received == expected, (
-            f"previous stage sent {received}, this stage expects {expected}"
-        )
-
-        group = (
-            pp_group.cpu_group
-            if self.device == torch.device("cpu")
-            else pp_group.device_group
-        )
-        handles = [
-            torch.distributed.irecv(
-                intermediate_tensors[name], src=pp_group.ranks[src], group=group
-            )
-            for name, _ in recv_metadata_list
-        ]
-        for handle in handles:
-            handle.wait()
-
-        return intermediate_tensors
 
     @torch.inference_mode()
     def execute_model(
@@ -3450,27 +3402,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
         self.kv_cache_view_infos = kv_cache_view_infos
 
     def _make_weights_contiguous(self) -> None:
-        """Force weights contiguous before weight-free compile, which hard-errors
-        on non-contiguous CPU tensors. Covers parameters, buffers, and plain
-        tensor attributes of the main model and, when present, the spec-decode
-        drafter model."""
-
-        def model_tensors(model: torch.nn.Module):
-            yield from model.parameters()
-            yield from model.buffers()
-            for module in model.modules():
-                for value in module.__dict__.values():
-                    if isinstance(value, torch.Tensor):
-                        yield value
-
         models = [self.model]
         if isinstance(self.drafter, DRAFT_MODEL_PROPOSERS):
             models.append(self.drafter.model)
-
-        for model in models:
-            for t in model_tensors(model):
-                if not t.is_contiguous():
-                    t.data = t.data.contiguous()
+        make_weights_contiguous(*models)
 
     @torch.inference_mode()
     def _warmup_sampler_decode_batches(self) -> None:

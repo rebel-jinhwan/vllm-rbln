@@ -69,6 +69,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
+from vllm_rbln.v1.worker.rbln_model_runner_v2 import RBLNModelRunnerV2
 from vllm_rbln.v1.worker.utils import (
     compile_and_warmup_skip_reason,
     estimate_model_kernel_size,
@@ -197,9 +198,11 @@ class RBLNWorker(WorkerBase):
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
-        self.model_runner: RBLNModelRunner = RBLNModelRunner(
-            self.vllm_config, self.device
-        )
+        self.model_runner: RBLNModelRunner | RBLNModelRunnerV2
+        if self.vllm_config.use_v2_model_runner:
+            self.model_runner = RBLNModelRunnerV2(self.vllm_config, self.device)
+        else:
+            self.model_runner = RBLNModelRunner(self.vllm_config, self.device)
         self.dynamic_kv = DynamicKvSizer(
             self.vllm_config, self.model_runner, foreign_dram_used_bytes
         )
@@ -601,7 +604,7 @@ class RBLNWorker(WorkerBase):
             intermediate_tensors = self.model_runner.recv_intermediate_tensors()
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-        if isinstance(output, ModelRunnerOutput | NoneType):
+        if isinstance(output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType):
             return output
 
         assert isinstance(output, IntermediateTensors)

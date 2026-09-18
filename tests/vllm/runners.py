@@ -391,6 +391,39 @@ class HfRunner:
             results.append((new_ids.tolist(), text, logprobs))
         return results
 
+    def prompt_logprobs(
+        self, prompts: list[str], num_logprobs: int
+    ) -> list[tuple[list[int], str, list[dict[int, float]]]]:
+        """Per prompt position from the second on: the top-k next-token
+        logprobs the model assigns given the prefix, with the model's own pick
+        standing where generate_greedy_logprobs puts the sampled token."""
+        results = []
+        for prompt in prompts:
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            with torch.no_grad():
+                logits = self.model(**inputs).logits[0, :-1].float()
+            step_logprobs = torch.log_softmax(logits, dim=-1)
+            top = torch.topk(step_logprobs, num_logprobs, dim=-1)
+            logprobs = [
+                {int(t): float(v) for v, t in zip(values, indices)}
+                for values, indices in zip(top.values, top.indices)
+            ]
+            picks = top.indices[:, 0].tolist()
+            results.append((picks, "", logprobs))
+        return results
+
+    def embed(self, prompts: list[str]) -> list[torch.Tensor]:
+        """Last-token hidden state after the final norm, L2-normalized: what
+        vLLM's LAST pooler returns for a decoder converted to an embedding model."""
+        results = []
+        for prompt in prompts:
+            inputs = self.tokenizer(prompt, return_tensors="pt")
+            with torch.no_grad():
+                hidden = self.model(**inputs, output_hidden_states=True).hidden_states
+            last = hidden[-1][0, -1].float()
+            results.append(torch.nn.functional.normalize(last, p=2, dim=-1))
+        return results
+
     def __enter__(self) -> HfRunner:
         return self
 

@@ -40,6 +40,7 @@ from . import (
     metrics,
     minimax_m2,
     mla,
+    model_runner_v2,
     modelopt_mixed_config,
     models_utils,
     multiproc_executor,
