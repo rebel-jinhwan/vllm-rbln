@@ -599,6 +599,23 @@ def _gumbel_seed(seed: int, pos: int) -> int:
     return hash((seed, pos)) & 0x7FFF_FFFF_FFFF_FFFF
 
 
+def _gumbel_noise(seed: int, pos: int, vocab_size: int, use_fp64: bool) -> torch.Tensor:
+    """The per-(seed, position) Gumbel noise row that upstream's philox stream
+    plays here: the same pair always yields the same row."""
+    generator = torch.Generator().manual_seed(_gumbel_seed(seed, pos))
+    dtype = torch.float64 if use_fp64 else torch.float32
+    u = torch.rand(vocab_size, generator=generator, dtype=dtype)
+    if use_fp64:
+        return -torch.log(-torch.log(u.clamp(min=2.2250738585072014e-308)))
+    return -torch.log(-torch.log1p(-u.clamp(min=4.6566127342e-10)))
+
+
+def _uniform(seed: int, pos: int) -> float:
+    """One draw in (0, 1) per (seed, position), independent of the row above."""
+    generator = torch.Generator().manual_seed(_gumbel_seed(seed, pos) ^ 0x5BD1E995)
+    return float(torch.rand(1, generator=generator).clamp(min=1e-30))
+
+
 def _gumbel_sample(
     grid,
     local_argmax,
@@ -647,18 +664,12 @@ def _gumbel_sample(
         random_rows = torch.nonzero(random).view(-1)
         seed_list = seeds[req[random_rows]].tolist()
         pos_list = pos[random_rows].tolist()
-        noise = torch.empty(random_rows.shape[0], vocab_size, dtype=y.dtype)
-        for i, (seed, position) in enumerate(zip(seed_list, pos_list)):
-            generator = torch.Generator().manual_seed(
-                _gumbel_seed(int(seed), int(position))
-            )
-            u = torch.rand(vocab_size, generator=generator, dtype=y.dtype)
-            if USE_FP64:
-                u = u.clamp(min=2.2250738585072014e-308)
-                noise[i] = -torch.log(-torch.log(u))
-            else:
-                u = u.clamp(min=4.6566127342e-10)
-                noise[i] = -torch.log(-torch.log1p(-u))
+        noise = torch.stack(
+            [
+                _gumbel_noise(int(seed), int(position), vocab_size, USE_FP64)
+                for seed, position in zip(seed_list, pos_list)
+            ]
+        )
         y[random_rows] = y[random_rows] + noise.to(y.device)
 
     value, index = y.max(dim=-1)
@@ -1250,3 +1261,146 @@ for _name, _fn in (
         target=f"vllm.v1.worker.gpu.pp_utils.PPHandler.{_name}",
         reason=_NO_CUDA_PP_REASON,
     )(_fn)
+
+
+# --- speculative decoding: rejection sampling and draft token hand-off ------
+_REJECTION_SAMPLER = "vllm.v1.worker.gpu.spec_decode.rejection_sampler"
+
+
+def _flatten_sampled(
+    grid, flat_sampled, sampled, _stride, num_sampled, cu_num_logits, **_
+) -> None:
+    num_reqs = grid[0]
+    counts = num_sampled[:num_reqs].tolist()
+    starts = cu_num_logits[:num_reqs].tolist()
+    rows = [r for r, n in enumerate(counts) for _ in range(n)]
+    cols = [i for n in counts for i in range(n)]
+    flat = [starts[r] + i for r, n in enumerate(counts) for i in range(n)]
+    if flat:
+        flat_sampled[torch.tensor(flat, device=flat_sampled.device)] = sampled[
+            torch.tensor(rows, device=sampled.device),
+            torch.tensor(cols, device=sampled.device),
+        ]
+
+
+_patch_kernel(_REJECTION_SAMPLER, "_flatten_sampled_kernel", _flatten_sampled)
+
+
+def _rejection_sample(
+    target_logits: torch.Tensor,
+    draft_logits: torch.Tensor | None,
+    draft_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    pos: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    num_speculative_steps: int,
+    synthetic_conditional_rates: torch.Tensor | None = None,
+    use_fp64: bool = False,
+    use_block_verification: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Upstream's rejection_sample on host-driven torch: per request, accept
+    draft tokens while the target agrees (greedy) or passes the acceptance test
+    (random), then recover one token from the residual or the bonus logits."""
+    if synthetic_conditional_rates is not None or use_block_verification:
+        raise NotImplementedError(
+            "RBLN rejection sampling supports rejection_sample_method='standard' only"
+        )
+    num_reqs = cu_num_logits.shape[0] - 1
+    logits = target_logits.float()
+    cu = cu_num_logits.tolist()
+    req_state = idx_mapping[:num_reqs].long()
+    temps = temperature[req_state].tolist()
+    seeds = seed[req_state].tolist()
+    req_state = req_state.tolist()
+    positions = pos.tolist()
+    drafts = draft_sampled.tolist()
+    target_argmax = logits.argmax(dim=-1).tolist()
+    sampled = torch.zeros(num_reqs, num_speculative_steps + 1, dtype=torch.int64)
+    num_sampled = torch.zeros(num_reqs, dtype=torch.int32)
+
+    def draft_log_probs(r: int, step: int) -> torch.Tensor | None:
+        if draft_logits is None:
+            return None
+        row = draft_logits[req_state[r], step, : logits.shape[1]].float()
+        return torch.log_softmax(row, dim=-1)
+
+    for r in range(num_reqs):
+        start, end = cu[r], cu[r + 1]
+        greedy = temps[r] == 0.0
+        accepted = 0
+        for i in range(end - start - 1):
+            li = start + i
+            d = drafts[li + 1]
+            if greedy:
+                t = target_argmax[li]
+                ok = t == d
+                sampled[r, i] = d if ok else t
+            else:
+                lp = torch.log_softmax(logits[li], dim=-1)[max(d, 0)].item()
+                q = draft_log_probs(r, i)
+                if q is not None:
+                    lp -= q[max(d, 0)].item()
+                ok = d >= 0 and lp > np.log(_uniform(seeds[r], positions[li]))
+                sampled[r, i] = max(d, 0)
+            if not ok:
+                break
+            accepted += 1
+        idx = start + accepted
+        is_bonus = idx == end - 1
+        if greedy:
+            if is_bonus:
+                sampled[r, accepted] = target_argmax[idx]
+        else:
+            row = torch.log_softmax(logits[idx], dim=-1)
+            if not is_bonus:
+                q = draft_log_probs(r, accepted)
+                if q is None:
+                    row = row.clone()
+                    row[drafts[idx + 1]] = float("-inf")
+                else:
+                    ratio = torch.exp(q - row)
+                    row = torch.where(
+                        ratio < 1.0, row + torch.log1p(-ratio), float("-inf")
+                    )
+            noise = _gumbel_noise(seeds[r], positions[idx], row.shape[0], use_fp64)
+            sampled[r, accepted] = int((row.cpu().to(noise.dtype) + noise).argmax())
+        num_sampled[r] = accepted + 1
+    return sampled.to(logits.device), num_sampled.to(logits.device)
+
+
+register_patch(
+    target=f"{_REJECTION_SAMPLER}.rejection_sample",
+    reason=_NO_TRITON_REASON,
+)(_rejection_sample)
+
+
+def _draft_tokens_handler_init(self, device: torch.device | None = None) -> None:
+    self.device = device
+    self.copy_stream = None
+    self.copy_event = types.SimpleNamespace(synchronize=lambda: None)
+    self.req_ids = []
+    self.draft_tokens_np = None
+    self.num_draft_tokens = 0
+
+
+def _draft_tokens_handler_set(self, input_batch: InputBatch, draft_tokens) -> None:
+    self.req_ids = input_batch.req_ids
+    self.num_draft_tokens = draft_tokens.shape[1]
+    self.draft_tokens_np = (
+        _to_cpu(draft_tokens) if input_batch.has_structured_output_reqs else None
+    )
+
+
+for _handler_name, _handler_fn in (
+    ("__init__", _draft_tokens_handler_init),
+    ("set_draft_tokens", _draft_tokens_handler_set),
+):
+    register_patch(
+        target="vllm.v1.worker.gpu.spec_decode.utils.DraftTokensHandler."
+        + _handler_name,
+        reason=_NO_CUDA_REASON,
+    )(_handler_fn)

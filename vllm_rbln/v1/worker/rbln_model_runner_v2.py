@@ -24,6 +24,7 @@ logits computed inside the graph.
 
 import functools
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -61,6 +62,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import attach_kv_cache_bindings
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import decode_batch_size, step_is_prefill
+from vllm_rbln.v1.spec_decode.eagle_v2 import RBLNEagleSpeculator
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.dp_utils import (
@@ -98,6 +100,22 @@ def _without_cuda_streams():
         torch.cuda.Stream, torch.cuda.Event = saved  # type: ignore[misc]
 
 
+@dataclass
+class StepShape:
+    """The rows a step staged for the target, kept for the draft that follows:
+    the draft runs on the same rows with its own tokens."""
+
+    layout: InputLayout
+    input_ids: torch.Tensor
+    """``[num_reqs, query_len]`` on the device, before the stager's padding."""
+    positions: np.ndarray
+    """``[num_reqs, query_len]`` host positions of those rows."""
+    front_pad: np.ndarray
+    """Per request, how many already-computed tokens open its row: a decode
+    window near ``max_model_len`` starts early rather than run past it."""
+    block_tables: tuple[torch.Tensor, ...]
+
+
 class RBLNModelRunnerV2(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device) -> None:
         parallel_config = vllm_config.parallel_config
@@ -105,7 +123,6 @@ class RBLNModelRunnerV2(GPUModelRunner):
         unsupported = [
             name
             for name, enabled in (
-                ("speculative decoding", vllm_config.speculative_config is not None),
                 ("LoRA", vllm_config.lora_config is not None),
                 ("multimodal models", model_config.is_multimodal_model),
                 ("the host-tensor path", not USE_DEVICE_TENSOR),
@@ -123,9 +140,11 @@ class RBLNModelRunnerV2(GPUModelRunner):
         with _without_cuda_streams():
             super().__init__(vllm_config, device)
         self.output_copy_stream = None
+        if vllm_config.speculative_config is not None and self.is_last_pp_rank:
+            self.speculator = RBLNEagleSpeculator(vllm_config, device, self)
 
         # Step phase, stamped from the scheduler output before anything reads it.
-        self.is_prefill = False
+        self.is_prefill: bool = False
         self.rbln_config: RBLNConfig = vllm_config.additional_config
         self.runtime_holder: list = []
         self.input_stager = InputStager(device)
@@ -145,7 +164,10 @@ class RBLNModelRunnerV2(GPUModelRunner):
             self.bucketing_manager.decode_batch_buckets,
         )
         self.specialized_moe_decode = False
-        self.shape_config = ShapeConfig(
+        # Read by the worker's runtime count: with a drafter every decode row
+        # is decode_query_len wide (see execute_model), so one decode graph.
+        self.uses_fixed_decode_window = True
+        self.shape_config: ShapeConfig = ShapeConfig(
             decode_batch_buckets=self.bucketing_manager.decode_batch_buckets,
             find_bucket=self.bucketing_manager.find_decode_batch_bucket,
             max_num_tokens=self.max_num_tokens,
@@ -164,6 +186,10 @@ class RBLNModelRunnerV2(GPUModelRunner):
         # Logits leave the compiled graph with the hidden states, so they are
         # carried from execute_model() to sample() here rather than recomputed.
         self._step_logits: torch.Tensor | None = None
+        # Rows of _step_logits that upstream's logits_indices name, in the
+        # staged layout; None on a prefill, whose graph gathered them already.
+        self._step_logits_index: torch.Tensor | None = None
+        self.step_shape: StepShape | None = None
         # PP hand-off buffers per staged shape; see recv_intermediate_tensors.
         self.intermediate_tensors_dict: dict[tuple[int, int], IntermediateTensors] = {}
         # What this step's DP ranks reported; None on a single rank.
@@ -177,6 +203,8 @@ class RBLNModelRunnerV2(GPUModelRunner):
         with self.offload_context():
             super().load_model(load_dummy_weights, *args, **kwargs)
         make_weights_contiguous(self.model)
+        if self.speculator is not None:
+            make_weights_contiguous(self.speculator.model)
 
         def model_wrapper(
             input_ids: torch.Tensor,
@@ -315,46 +343,40 @@ class RBLNModelRunnerV2(GPUModelRunner):
             batch_desc.num_tokens_padded,
         )
 
-    def _build_attn_metadata(
+    def build_attn_metadata(
         self,
-        input_batch: InputBatch,
+        attn_groups: list[list[Any]],
+        num_reqs: int,
         num_reqs_padded: int,
+        query_start_loc_cpu: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        positions_cpu: torch.Tensor,
         block_tables: tuple[torch.Tensor, ...],
+        is_prefill: bool,
     ) -> dict[str, Any]:
-        num_reqs = input_batch.num_reqs
-        num_tokens = input_batch.num_tokens
-        num_scheduled = input_batch.num_scheduled_tokens
-        query_start_loc_np = input_batch.query_start_loc_np[: num_reqs + 1]
-        # The RBLN builder reads each request's first position from a host
-        # positions tensor; upstream keeps positions on the device only.
-        positions_np = np.repeat(
-            input_batch.num_computed_tokens_np[:num_reqs], num_scheduled
-        ) + (np.arange(num_tokens) - np.repeat(query_start_loc_np[:-1], num_scheduled))
-        positions_cpu = torch.from_numpy(positions_np.astype(np.int64))
-        query_start_loc_cpu = torch.from_numpy(query_start_loc_np)
-        seq_lens_cpu = input_batch.seq_lens_cpu_upper_bound[:num_reqs]
-
+        """Per-layer RBLN attention metadata for the given groups: the target's
+        or the draft's, which share the KV cache groups and block tables."""
         attn_metadata: dict[str, Any] = {}
-        for gid in range(len(self.kv_cache_config.kv_cache_groups)):
+        for gid, groups in enumerate(attn_groups):
             common = CommonAttentionMetadata(
                 query_start_loc=query_start_loc_cpu,
                 query_start_loc_cpu=query_start_loc_cpu,
                 seq_lens=seq_lens_cpu,
                 num_reqs=num_reqs,
-                num_actual_tokens=num_tokens,
-                max_query_len=int(num_scheduled.max()),
+                num_actual_tokens=int(query_start_loc_cpu[num_reqs]),
+                max_query_len=int(query_start_loc_cpu[1]),
                 max_seq_len=int(seq_lens_cpu.max()),
                 block_table_tensor=block_tables[gid][:num_reqs],
                 slot_mapping=torch.tensor(0),  # unused by the RBLN kernels
                 causal=True,
             )
-            for attn_group in self.attn_groups[gid]:
+            for attn_group in groups:
                 builder = attn_group.get_metadata_builder(0)
                 assert isinstance(builder, RBLNFlashAttentionMetadataBuilder)
                 metadata = builder.build(
                     common_attn_metadata=common,
                     positions=positions_cpu,
-                    is_prefill=self.is_prefill,
+                    is_prefill=is_prefill,
                     batch_pad=num_reqs_padded,
                 )
                 attach_kv_cache_bindings(metadata, self.kv_caches, None, None)
@@ -386,8 +408,13 @@ class RBLNModelRunnerV2(GPUModelRunner):
 
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_tokens = scheduler_output.total_num_scheduled_tokens
+        # With a drafter every decode row is decode_query_len wide, whatever
+        # each request brought, so one decode graph serves every step.
+        fixed_window = self.speculative_config is not None and not self.is_prefill
         batch_desc, num_tokens_across_dp, num_padded_tokens = self._batch_descriptor(
-            num_reqs, num_tokens, is_idle
+            num_reqs,
+            num_reqs * self.decode_query_len if fixed_window else num_tokens,
+            is_idle,
         )
         if batch_desc is None:
             # Every DP rank is idle: they all read the same status and stop here.
@@ -406,12 +433,46 @@ class RBLNModelRunnerV2(GPUModelRunner):
         slot_mappings_by_layer = build_slot_mappings_by_layer(
             slot_mappings, self.kv_cache_config
         )
-        attn_metadata = self._build_attn_metadata(
-            input_batch, batch_desc.num_reqs, block_tables
-        )
 
         query_len = batch_desc.uniform_token_count
         query_len_padded = batch_desc.num_tokens // batch_desc.num_reqs
+        num_computed = input_batch.num_computed_tokens_np[:num_reqs]
+        num_scheduled = input_batch.num_scheduled_tokens[:num_reqs]
+        cols = np.arange(query_len)
+        front_pad = np.zeros(num_reqs, dtype=np.int32)
+        if not fixed_window:
+            input_ids = input_batch.input_ids[:num_tokens].view(num_reqs, query_len)
+        else:
+            front_pad = np.maximum(
+                0, num_computed + query_len - self.max_model_len
+            ).astype(np.int32)
+            # Row column -> this request's scheduled token, the last one
+            # repeated past the end and the already-computed ones before it.
+            local = cols[None, :] - front_pad[:, None]
+            src = input_batch.query_start_loc_np[:num_reqs, None] + np.clip(
+                local, 0, num_scheduled[:, None] - 1
+            )
+            input_ids = input_batch.input_ids[torch.from_numpy(src).to(self.device)]
+        positions_np = (num_computed - front_pad)[:, None] + cols[None, :]
+        if front_pad.any():
+            before_window = self.req_states.all_token_ids.gpu[
+                input_batch.idx_mapping.long()[:, None],
+                torch.from_numpy(positions_np).to(self.device),
+            ]
+            input_ids = torch.where(
+                torch.from_numpy(local >= 0).to(self.device), input_ids, before_window
+            )
+        positions_np = positions_np.astype(np.int64)
+        attn_metadata = self.build_attn_metadata(
+            self.attn_groups,
+            num_reqs,
+            batch_desc.num_reqs,
+            torch.from_numpy(np.arange(num_reqs + 1, dtype=np.int32) * query_len),
+            input_batch.seq_lens_cpu_upper_bound[:num_reqs],
+            torch.from_numpy(positions_np.reshape(-1)),
+            block_tables,
+            self.is_prefill,
+        )
         if not self.is_first_pp_rank and (dummy_run or is_idle):
             # A previous stage's output arrives already padded; a dummy step has
             # to build its stand-in at the same padded shape.
@@ -429,9 +490,25 @@ class RBLNModelRunnerV2(GPUModelRunner):
             query_len=query_len,
             query_len_padded=query_len_padded,
         )
+        self.step_shape = StepShape(
+            layout, input_ids, positions_np, front_pad, block_tables
+        )
+        if self.is_prefill:
+            self._step_logits_index = None
+        else:
+            # Each request's logits are its last cu_num_logits tokens.
+            num_logits = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+            rows = np.repeat(np.arange(num_reqs), num_logits)
+            offset = np.arange(int(num_logits.sum())) - np.repeat(
+                input_batch.cu_num_logits_np[:num_reqs], num_logits
+            )
+            local = (front_pad + num_scheduled - num_logits)[rows] + offset
+            self._step_logits_index = torch.from_numpy(
+                rows * query_len_padded + local
+            ).to(self.device)
         staged = self.input_stager.stage(
-            input_ids=input_batch.input_ids[:num_tokens].view(num_reqs, query_len),
-            positions=input_batch.positions[:num_tokens].view(num_reqs, query_len),
+            input_ids=input_ids,
+            positions=torch.from_numpy(positions_np),
             intermediate_tensors=intermediate_tensors,
             token_indices=(
                 input_batch.logits_indices.to(torch.int32)
@@ -478,7 +555,10 @@ class RBLNModelRunnerV2(GPUModelRunner):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         assert self._step_logits is not None
-        logits = self._step_logits[: input_batch.logits_indices.shape[0]]
+        if self._step_logits_index is None:
+            logits = self._step_logits[: input_batch.logits_indices.shape[0]]
+        else:
+            logits = self._step_logits[self._step_logits_index]
         self._step_logits = None
         if grammar_output is not None:
             assert self.structured_outputs_worker is not None
@@ -489,7 +569,13 @@ class RBLNModelRunnerV2(GPUModelRunner):
                 grammar_output.grammar_bitmask,
             )
         assert self.sampler is not None
-        sampler_output = self.sampler(logits, input_batch)
+        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+            sampler_output = self.sampler(logits, input_batch)
+        else:
+            assert self.speculator is not None
+            sampler_output = self.rejection_sampler(
+                logits, input_batch, self.speculator.draft_logits
+            )
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
     @torch.inference_mode()
@@ -513,6 +599,25 @@ class RBLNModelRunnerV2(GPUModelRunner):
         self.kv_connector.set_disabled(True)
         self.execute_model(scheduler_output, dummy_run=True, is_idle=not warmup)
         self.kv_connector.set_disabled(False)
+        state = self.execute_model_state
+        if self.speculator is not None and state is not None:
+            assert self.sampler is not None
+            self.speculator.propose(
+                input_batch=state.input_batch,
+                attn_metadata=state.attn_metadata,
+                slot_mappings=state.slot_mappings_by_layer,
+                last_hidden_states=state.hidden_states,
+                aux_hidden_states=None,
+                num_sampled=torch.ones(num_reqs, dtype=torch.int32, device=self.device),
+                num_rejected=torch.zeros(
+                    num_reqs, dtype=torch.int32, device=self.device
+                ),
+                last_sampled=self.req_states.last_sampled_tokens,
+                next_prefill_tokens=self.req_states.next_prefill_tokens,
+                temperature=self.sampler.sampling_states.temperature.gpu,
+                seeds=self.sampler.sampling_states.seeds.gpu,
+                dummy_run=True,
+            )
         self.execute_model_state = None
         self._step_logits = None
 
@@ -523,5 +628,5 @@ class RBLNModelRunnerV2(GPUModelRunner):
         with set_compile_stage("warmup"), self.offload_context():
             self._dummy_run(1, self.max_num_tokens, True)
             for num_reqs in self.bucketing_manager.decode_batch_buckets:
-                self._dummy_run(num_reqs, 1, False)
+                self._dummy_run(num_reqs, self.decode_query_len, False)
         mega_cache.save(self.model_config.model, sig)

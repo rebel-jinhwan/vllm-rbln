@@ -405,3 +405,93 @@ def test_staged_write_tensor_flushes_rows():
     flat.apply_write()
     assert flat.gpu.tolist() == [0, 0, 0, 5]
     assert np.array_equal(t.gpu.numpy()[1], np.zeros(6, dtype=np.int32))
+
+
+def _rejection_inputs(num_reqs, cu, temps, seeds=None):
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+    del RejectionSampler  # imported for its module-level patch target only
+    cu_num_logits = _i32(cu)
+    num_logits = cu[-1]
+    idx_mapping = _i32(list(range(num_reqs)))
+    temperature = torch.zeros(MAX_REQS)
+    temperature[:num_reqs] = torch.tensor(temps)
+    seed = _i64(seeds or [0] * MAX_REQS)
+    pos = _i32(list(range(num_logits)))
+    return cu_num_logits, idx_mapping, temperature, seed, pos
+
+
+def test_rejection_sample_greedy_accepts_matching_prefix():
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rs
+
+    # req 0: drafts [3, 7] with target argmax [3, 9, 5] -> accept 3, recover 9
+    # req 1: drafts [1] fully accepted -> bonus argmax 4 appended
+    # req 2: no drafts -> plain bonus 2
+    cu = [0, 3, 5, 6]
+    logits = torch.full((6, VOCAB), -10.0)
+    for row, tok in enumerate([3, 9, 5, 1, 4, 2]):
+        logits[row, tok] = 0.0
+    draft_sampled = _i32([-1, 3, 7, -1, 1, -1])
+    cu_num_logits, idx_mapping, temperature, seed, pos = _rejection_inputs(
+        3, cu, [0.0, 0.0, 0.0]
+    )
+    sampled, num_sampled = rs.rejection_sample(
+        logits,
+        None,
+        draft_sampled,
+        cu_num_logits,
+        pos,
+        idx_mapping,
+        idx_mapping,
+        torch.zeros(6, dtype=torch.int32),
+        temperature,
+        seed,
+        num_speculative_steps=2,
+    )
+    assert num_sampled.tolist() == [2, 2, 1]
+    assert sampled[0, :2].tolist() == [3, 9]
+    assert sampled[1, :2].tolist() == [1, 4]
+    assert sampled[2, :1].tolist() == [2]
+
+
+def test_rejection_sample_random_never_resamples_rejected_draft():
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rs
+
+    # Target puts no mass on the draft token, so every seed rejects it, and
+    # the recovered token must come from the residual: anything but 7.
+    cu = [0, 2]
+    logits = torch.zeros(2, VOCAB)
+    logits[0, 7] = float("-inf")
+    draft_sampled = _i32([-1, 7])
+    for s in range(5):
+        cu_num_logits, idx_mapping, temperature, seed, pos = _rejection_inputs(
+            1, cu, [1.0], seeds=[s] * MAX_REQS
+        )
+        sampled, num_sampled = rs.rejection_sample(
+            logits,
+            None,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            idx_mapping,
+            idx_mapping,
+            torch.zeros(2, dtype=torch.int32),
+            temperature,
+            seed,
+            num_speculative_steps=1,
+        )
+        assert num_sampled.tolist() == [1]
+        assert sampled[0, 0].item() != 7
+
+
+def test_flatten_sampled_places_each_request_at_its_logit_offset():
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rs
+
+    sampled = _i64([[10, 11, 12], [20, 21, 22]])
+    num_sampled = _i32([2, 1])
+    cu_num_logits = _i32([0, 3, 6])
+    flat = torch.zeros(6, dtype=torch.int64)
+    rs._flatten_sampled_kernel[(2,)](
+        flat, sampled, sampled.stride(0), num_sampled, cu_num_logits, num_warps=1
+    )
+    assert flat.tolist() == [10, 11, 0, 20, 0, 0]
