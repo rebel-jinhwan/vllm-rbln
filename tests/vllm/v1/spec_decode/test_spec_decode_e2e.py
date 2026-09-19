@@ -21,7 +21,7 @@ import warnings
 import pytest
 from vllm.config import SpeculativeConfig
 
-from tests.vllm.utils import check_outputs_almost_equal
+from tests.vllm.utils import check_outputs_almost_equal, rbln_device_count
 from tests.vllm.v1.spec_decode.utils import (
     _DRAFT,
     MEDUSA_DRAFT,
@@ -149,3 +149,37 @@ def test_speculative_decoding_matches_reference(
     # leave the draft's predictions unrelated to the target's, so nothing hits.
     if method in _EXPECT_ACCEPTANCE and whole_model:
         assert accepted > 0, f"spec:{method} accepted no draft tokens"
+
+
+@pytest.mark.model_compile
+@pytest.mark.parametrize("method", ["eagle", "eagle3"])
+def test_speculative_decoding_v2_model_runner(
+    vllm_runner, method: str, whole_model: bool, monkeypatch
+) -> None:
+    """The draft on RBLNModelRunnerV2 runs as compiled graphs on the target's
+    staged rows and the torch rejection sampler verifies it. Greedy output must
+    match the same runner without a drafter; with every layer built drafts must
+    also be accepted, since a runner that proposed nothing useful would still
+    pass the first check."""
+    if rbln_device_count() < 2:
+        pytest.skip("the reference EAGLE pairs run with tensor_parallel_size=2")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    target, extra_kwargs, spec_config = SPEC_METHODS[method]
+    spec_config = {**spec_config, "model": local_weights_path(spec_config["model"])}
+
+    with vllm_runner(target, **extra_kwargs) as plain:
+        plain_outputs = plain.generate_greedy_logprobs(
+            [PROMPT], MAX_TOKENS, NUM_LOGPROBS
+        )
+    with vllm_runner(target, **extra_kwargs, speculative_config=spec_config) as spec:
+        spec_outputs = spec.generate_greedy_logprobs([PROMPT], MAX_TOKENS, NUM_LOGPROBS)
+        accepted = spec.spec_decode_accepted_tokens()
+
+    check_outputs_almost_equal(
+        outputs_0_lst=plain_outputs,
+        outputs_1_lst=spec_outputs,
+        name_0="v2",
+        name_1=f"v2:{method}",
+    )
+    if whole_model:
+        assert accepted > 0, f"v2:{method} accepted no draft tokens"

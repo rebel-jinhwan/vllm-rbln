@@ -20,13 +20,7 @@ import torch
 from vllm import SamplingParams
 
 from tests.vllm.runners import DPRequest
-from tests.vllm.utils import (
-    check_logprobs_close,
-    check_outputs_almost_equal,
-    rbln_device_count,
-)
-from tests.vllm.v1.spec_decode.utils import _DRAFT, TARGET_MODEL
-from tests.vllm.vllm_config import local_weights_path
+from tests.vllm.utils import check_logprobs_close, rbln_device_count
 
 MODEL = "Qwen/Qwen3-0.6B"
 PROMPTS = [
@@ -208,36 +202,3 @@ def test_data_parallel_matches_hf(hf_runner, async_vllm_runner, monkeypatch) -> 
         name_0="hf",
         name_1="v2 after its peer finished",
     )
-
-
-@pytest.mark.model_compile
-def test_eagle_speculative_decoding(vllm_runner, monkeypatch, whole_model) -> None:
-    """EAGLE drafts on the V2 runner: the draft runs as compiled graphs on the
-    target's staged rows and the torch rejection sampler verifies them. Greedy
-    output must match the same runner without a drafter; with every layer built
-    drafts must also be accepted, since a runner that proposed nothing useful
-    would still pass the first check."""
-    if rbln_device_count() < 2:
-        pytest.skip("the reference EAGLE pair runs with tensor_parallel_size=2")
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    kwargs = dict(max_model_len=2048, tensor_parallel_size=2, max_num_seqs=4)
-    spec = {
-        "method": "eagle",
-        "model": local_weights_path(_DRAFT["eagle"]),
-        "num_speculative_tokens": 3,
-    }
-    prompt = "The quick brown fox jumps over the lazy dog. " * 20
-    with vllm_runner(TARGET_MODEL, **kwargs) as plain:
-        plain_outputs = plain.generate_greedy_logprobs([prompt], 16, 5)
-    with vllm_runner(TARGET_MODEL, **kwargs, speculative_config=spec) as spec_model:
-        spec_outputs = spec_model.generate_greedy_logprobs([prompt], 16, 5)
-        accepted = spec_model.spec_decode_accepted_tokens()
-
-    check_outputs_almost_equal(
-        outputs_0_lst=plain_outputs,
-        outputs_1_lst=spec_outputs,
-        name_0="v2",
-        name_1="v2:eagle",
-    )
-    if whole_model:
-        assert accepted > 0

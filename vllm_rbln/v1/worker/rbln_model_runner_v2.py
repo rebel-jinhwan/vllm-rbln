@@ -114,6 +114,9 @@ class StepShape:
     """Per request, how many already-computed tokens open its row: a decode
     window near ``max_model_len`` starts early rather than run past it."""
     block_tables: tuple[torch.Tensor, ...]
+    hidden_states: torch.Tensor | None
+    """What the draft reads instead of the target's last hidden states: eagle3's
+    aux states, combined by the drafter's projection inside the target graph."""
 
 
 class RBLNModelRunnerV2(GPUModelRunner):
@@ -214,7 +217,7 @@ class RBLNModelRunnerV2(GPUModelRunner):
             token_indices: torch.Tensor | None = None,
             **kwargs,
         ):
-            hidden_states = self.model(
+            model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
@@ -222,12 +225,21 @@ class RBLNModelRunnerV2(GPUModelRunner):
                 **kwargs,
             )
             if self.is_pooling_model or not self.is_last_pp_rank:
-                return hidden_states, None
+                return model_output, None, None
+            draft_hidden_states = None
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, aux_hidden_states = model_output
+                assert self.speculator is not None
+                draft_hidden_states = self.speculator.model.combine_hidden_states(
+                    torch.cat([h.view(-1, h.shape[-1]) for h in aux_hidden_states], -1)
+                )
+            else:
+                hidden_states = model_output
             sample_hidden_states = hidden_states
             if token_indices is not None:
                 sample_hidden_states = hidden_states[:, token_indices]
             logits = self.model.compute_logits(sample_hidden_states)
-            return hidden_states, logits.view(-1, logits.size(-1))
+            return hidden_states, logits.view(-1, logits.size(-1)), draft_hidden_states
 
         if self.model_config.enforce_eager or not self.rbln_config.compile_model:
             self.model_executable = model_wrapper
@@ -491,7 +503,7 @@ class RBLNModelRunnerV2(GPUModelRunner):
             query_len_padded=query_len_padded,
         )
         self.step_shape = StepShape(
-            layout, input_ids, positions_np, front_pad, block_tables
+            layout, input_ids, positions_np, front_pad, block_tables, None
         )
         if self.is_prefill:
             self._step_logits_index = None
@@ -526,7 +538,10 @@ class RBLNModelRunnerV2(GPUModelRunner):
             num_tokens_across_dp=num_tokens_across_dp,
             num_padded_tokens=num_padded_tokens,
         ):
-            model_output, logits = self.model_executable(**staged.as_kwargs())
+            model_output, logits, draft_hidden_states = self.model_executable(
+                **staged.as_kwargs()
+            )
+        self.step_shape.hidden_states = draft_hidden_states
 
         if self.is_last_pp_rank:
             hidden_states = model_output.reshape(-1, model_output.shape[-1])

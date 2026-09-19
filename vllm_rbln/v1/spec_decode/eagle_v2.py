@@ -49,7 +49,6 @@ class RBLNEagleSpeculator(EagleSpeculator):
         unsupported = [
             name
             for name, enabled in (
-                (f"method={self.method!r}", self.method != "eagle"),
                 ("multimodal drafts", self.supports_mm_inputs),
                 (
                     "draft_sample_method="
@@ -66,6 +65,7 @@ class RBLNEagleSpeculator(EagleSpeculator):
             )
         self.runner = runner
         self.input_stager = InputStager(device)
+        self.draft_id_to_target_id: torch.Tensor | None = None
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -76,6 +76,8 @@ class RBLNEagleSpeculator(EagleSpeculator):
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
         hidden_size = self.hidden_size
+        d2t = getattr(self.model, "draft_id_to_target_id", None)
+        self.draft_id_to_target_id = None if d2t is None else d2t.cpu()
 
         def model_wrapper(
             input_ids: torch.Tensor,
@@ -92,7 +94,12 @@ class RBLNEagleSpeculator(EagleSpeculator):
             if token_indices is not None:
                 hidden = hidden[token_indices]
                 sample_hidden = sample_hidden[token_indices]
-            logits = self.model.compute_logits(sample_hidden)
+            if self.draft_id_to_target_id is None:
+                logits = self.model.compute_logits(sample_hidden)
+            else:
+                # Draft-vocabulary logits; compute_logits would scatter them
+                # into the target vocabulary, which _to_target_ids does instead.
+                logits = self.model.logits_processor(self.model.lm_head, sample_hidden)
             return hidden, torch.ops.rbln.argmax(logits)
 
         rbln_config = self.runner.rbln_config
@@ -164,6 +171,8 @@ class RBLNEagleSpeculator(EagleSpeculator):
             next_tokens[:, None],
             draft_ids,
         )
+        if step.hidden_states is not None:
+            last_hidden_states = step.hidden_states
         hidden = last_hidden_states.view(
             layout.num_reqs_padded, layout.query_len_padded, -1
         )[:num_reqs, :query_len]
@@ -183,7 +192,8 @@ class RBLNEagleSpeculator(EagleSpeculator):
             num_reqs * query_len,
             first_pass=True,
         )
-        self.draft_tokens[:num_reqs, 0] = ids[:num_reqs]
+        ids = self._to_target_ids(ids[:num_reqs])
+        self.draft_tokens[:num_reqs, 0] = ids
         if self.num_speculative_steps == 1:
             return self.draft_tokens[:num_reqs, :1]
 
@@ -193,7 +203,7 @@ class RBLNEagleSpeculator(EagleSpeculator):
             seq_lens = np.minimum(seq_lens + 1, self.max_model_len)
             batch_desc, _ = self._batch(num_reqs, num_reqs, False, first_pass=False)
             hidden, ids = self._run(
-                ids[:num_reqs].view(-1, 1).to(step.input_ids.dtype),
+                ids.view(-1, 1).to(step.input_ids.dtype),
                 positions[:, None],
                 hidden[:num_reqs].unsqueeze(1),
                 None,
@@ -209,8 +219,18 @@ class RBLNEagleSpeculator(EagleSpeculator):
                 num_reqs,
                 first_pass=False,
             )
-            self.draft_tokens[:num_reqs, draft_step] = ids[:num_reqs]
+            ids = self._to_target_ids(ids[:num_reqs])
+            self.draft_tokens[:num_reqs, draft_step] = ids
         return self.draft_tokens[:num_reqs]
+
+    def _to_target_ids(self, draft_ids: torch.Tensor) -> torch.Tensor:
+        """`draft_id_to_target_id` holds offsets: upstream scatters draft logits
+        at `arange(draft_vocab) + d2t` before its argmax, and for that monotonic
+        mapping argmax-then-offset picks the same token."""
+        if self.draft_id_to_target_id is None:
+            return draft_ids
+        draft_ids = draft_ids.cpu()
+        return (draft_ids + self.draft_id_to_target_id[draft_ids]).to(self.device)
 
     def _batch(
         self, num_reqs: int, num_tokens: int, is_prefill: bool, *, first_pass: bool
