@@ -67,6 +67,7 @@ from vllm_rbln.distributed.kv_transfer.kv_connector.v1.utils import (
     finalize_kv_cache_registrations,
 )
 from vllm_rbln.logger import init_logger
+from vllm_rbln.v1.rbln.model_runner import RBLNModelRunnerV2
 from vllm_rbln.v1.worker.dynamic_kv_sizer import DynamicKvSizer
 from vllm_rbln.v1.worker.rbln_model_runner import RBLNModelRunner
 from vllm_rbln.v1.worker.utils import (
@@ -78,7 +79,6 @@ from vllm_rbln.v1.worker.utils import (
     set_omp_num_threads,
     worker_fail_fast,
 )
-from vllm_rbln.v2.worker.model_runner import RBLNModelRunnerV2
 
 logger = init_logger(__name__)
 

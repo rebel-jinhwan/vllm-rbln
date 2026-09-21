@@ -23,7 +23,7 @@ from vllm import SamplingParams
 
 from tests.vllm.runners import DPRequest
 from tests.vllm.utils import check_logprobs_close, rbln_device_count
-from vllm_rbln.v2.worker.model_runner import RBLNModelRunnerV2
+from vllm_rbln.v1.rbln.model_runner import RBLNModelRunnerV2
 
 MODEL = "Qwen/Qwen3-0.6B"
 PROMPTS = [
@@ -59,7 +59,7 @@ def test_sampling_and_penalties(vllm_runner, monkeypatch) -> None:
     calls is not asserted: the batched decode graph's logits differ between
     engine calls by rounding on this hardware (RBLNModelRunner as well), and
     a sampled token flips on that. The seed itself is covered on CPU in
-    tests/vllm/v2/worker/test_lm_serving_ops.py."""
+    tests/vllm/v1/rbln/test_kernels.py."""
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     greedy = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
     sampled = SamplingParams(

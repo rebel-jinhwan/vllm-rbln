@@ -19,19 +19,10 @@ RBLN components' coverage of the kernel methods upstream declares."""
 import numpy as np
 import pytest
 import torch
-from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
-from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
-    AutoRegressiveSpeculator,
-)
-from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
-from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+from vllm.v1.worker.gpu.kernels import TritonKernels
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
-from vllm_rbln.v2.spec_decode.eagle import RBLNEagleSpeculator
-from vllm_rbln.v2.worker.prompt_logprobs import RBLNPromptLogprobsWorker
-from vllm_rbln.v2.worker.rejection_sampler import RBLNRejectionSamplerV2
-from vllm_rbln.v2.worker.sampler import RBLNSamplerV2
-from vllm_rbln.v2.worker.structured_outputs import RBLNStructuredOutputsWorker
+from vllm_rbln.v1.rbln.kernels import RBLNKernels
 
 ops = torch.ops.rbln
 
@@ -48,54 +39,16 @@ def _i64(x):
     return torch.tensor(x, dtype=torch.int64)
 
 
-@pytest.mark.parametrize(
-    ("base", "rbln", "methods"),
-    [
-        (
-            Sampler,
-            RBLNSamplerV2,
-            (
-                "apply_temperature",
-                "apply_min_p",
-                "apply_penalties",
-                "bincount",
-                "apply_logit_bias",
-                "apply_bad_words",
-                "gumbel_sample",
-                "compute_token_logprobs",
-                "compute_token_ranks",
-                "fill_logprob_token_ids",
-                "get_num_nans",
-                "get_num_sampled_and_rejected",
-            ),
-        ),
-        (
-            RejectionSampler,
-            RBLNRejectionSamplerV2,
-            ("rejection_sample", "flatten_sampled"),
-        ),
-        (
-            PromptLogprobsWorker,
-            RBLNPromptLogprobsWorker,
-            ("get_prompt_logprobs_token_ids",),
-        ),
-        (StructuredOutputsWorker, RBLNStructuredOutputsWorker, ("apply_bitmask",)),
-        (
-            AutoRegressiveSpeculator,
-            RBLNEagleSpeculator,
-            (
-                "prepare_prefill_inputs",
-                "prepare_decode_inputs",
-                "update_draft_inputs",
-                "gumbel_sample",
-            ),
-        ),
-    ],
-)
-def test_components_override_every_kernel_method(base, rbln, methods):
-    for name in methods:
-        assert callable(getattr(base, name))
-        assert name in rbln.__dict__, f"{rbln.__name__} inherits upstream's {name}"
+def test_rbln_kernels_implement_the_whole_interface():
+    """ABC instantiation covers the abstract set; the second assert catches a
+    kernel upstream adds to TritonKernels without declaring it abstract."""
+    RBLNKernels()
+    triton_only = {
+        name
+        for name in vars(TritonKernels)
+        if callable(getattr(TritonKernels, name)) and not name.startswith("_")
+    } - set(ModelRunnerKernels.__abstractmethods__)
+    assert not triton_only
 
 
 def test_prepare_prefill_inputs_copies_prompt_chunks_and_next_token():

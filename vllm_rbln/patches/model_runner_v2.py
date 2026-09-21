@@ -13,8 +13,8 @@
 # limitations under the License.
 
 """Method-level replacement in upstream's V2 model runner for what RBLN's
-torch build cannot run. The runner's Triton kernels are not patched: the
-`vllm_rbln.v2` components override upstream's kernel methods.
+torch build cannot run. The runner's Triton kernels are not patched:
+`vllm_rbln.v1.rbln.kernels` implements upstream's kernel interface.
 """
 
 from vllm.v1.worker.gpu.input_batch import InputBatch
