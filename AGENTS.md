@@ -49,7 +49,7 @@ The codebase already has a word for each of these. Use it, and do not reach for 
 | Path         | Owns                                                                        |
 | ------------ | --------------------------------------------------------------------------- |
 | optimum      | `model_executor/models/optimum/`, `utils/optimum/`, `v1/worker/optimum_*.py`, `platform/optimum_impl.py` |
-| vllm         | `patches/`, `compilation/`, `v1/worker/rbln_*.py`, `platform/vllm_impl.py` |
+| vllm         | `patches/`, `compilation/`, `v1/worker/rbln_*.py`, `v2/`, `platform/vllm_impl.py` |
 | shared       | everything else |
 
 **`envs.py` defines the flag; only `__init__.py` and `platform/__init__.py` branch on it.** Do not branch on `VLLM_RBLN_USE_VLLM_MODEL` anywhere else. Path-specific code belongs in the module that path owns.

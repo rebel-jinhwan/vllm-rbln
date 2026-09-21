@@ -56,7 +56,7 @@ def test_sampling_and_penalties(vllm_runner, monkeypatch) -> None:
     calls is not asserted: the batched decode graph's logits differ between
     engine calls by rounding on this hardware (RBLNModelRunner as well), and
     a sampled token flips on that. The seed itself is covered on CPU in
-    tests/vllm/patches/test_model_runner_v2.py."""
+    tests/vllm/v2/worker/test_lm_serving_ops.py."""
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     greedy = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
     sampled = SamplingParams(

@@ -1,4 +1,4 @@
-# Copyright 2025 Rebellions Inc. All rights reserved.
+# Copyright 2026 Rebellions Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,24 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The torch stand-ins for upstream V2's triton kernels, driven through the
-upstream wrappers on CPU tensors and checked against a plain-python reference
-of each kernel."""
+"""The `rbln::` custom ops behind the V2 runner's kernel methods, checked on
+CPU tensors against a plain-python reading of each upstream kernel, and the
+RBLN components' coverage of the kernel methods upstream declares."""
 
 import numpy as np
 import pytest
 import torch
-from vllm.triton_utils.importing import PlaceholderKernel
-from vllm.v1.worker.gpu import input_batch as ib
-from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample.bad_words import apply_bad_words
-from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
-from vllm.v1.worker.gpu.sample.logit_bias import apply_logit_bias
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
-from vllm.v1.worker.gpu.sample.min_p import apply_min_p
-from vllm.v1.worker.gpu.sample.penalties import apply_penalties, bincount
-from vllm.v1.worker.gpu.sample.prompt_logprob import get_prompt_logprobs_token_ids
-from vllm.v1.worker.gpu.structured_outputs import _apply_grammar_bitmask_kernel
+from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
+)
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+
+from vllm_rbln.v2.spec_decode.eagle import RBLNEagleSpeculator
+from vllm_rbln.v2.worker.prompt_logprobs import RBLNPromptLogprobsWorker
+from vllm_rbln.v2.worker.rejection_sampler import RBLNRejectionSamplerV2
+from vllm_rbln.v2.worker.sampler import RBLNSamplerV2
+from vllm_rbln.v2.worker.structured_outputs import RBLNStructuredOutputsWorker
+
+ops = torch.ops.rbln
 
 MAX_REQS = 8
 MAX_LEN = 32
@@ -44,12 +48,54 @@ def _i64(x):
     return torch.tensor(x, dtype=torch.int64)
 
 
-def test_kernels_resolve_to_torch_implementations():
-    from vllm.platforms import current_platform
-
-    for kernel in (ib._prepare_prefill_inputs_kernel, _apply_grammar_bitmask_kernel):
-        assert isinstance(kernel, PlaceholderKernel)
-        assert current_platform.get_kernel_impl(kernel.qualname) is not None
+@pytest.mark.parametrize(
+    ("base", "rbln", "methods"),
+    [
+        (
+            Sampler,
+            RBLNSamplerV2,
+            (
+                "apply_temperature",
+                "apply_min_p",
+                "apply_penalties",
+                "bincount",
+                "apply_logit_bias",
+                "apply_bad_words",
+                "gumbel_sample",
+                "compute_token_logprobs",
+                "compute_token_ranks",
+                "fill_logprob_token_ids",
+                "get_num_nans",
+                "get_num_sampled_and_rejected",
+            ),
+        ),
+        (
+            RejectionSampler,
+            RBLNRejectionSamplerV2,
+            ("rejection_sample", "flatten_sampled"),
+        ),
+        (
+            PromptLogprobsWorker,
+            RBLNPromptLogprobsWorker,
+            ("get_prompt_logprobs_token_ids",),
+        ),
+        (StructuredOutputsWorker, RBLNStructuredOutputsWorker, ("apply_bitmask",)),
+        (
+            AutoRegressiveSpeculator,
+            RBLNEagleSpeculator,
+            (
+                "prepare_prefill_inputs",
+                "prepare_decode_inputs",
+                "update_draft_inputs",
+                "gumbel_sample",
+            ),
+        ),
+    ],
+)
+def test_components_override_every_kernel_method(base, rbln, methods):
+    for name in methods:
+        assert callable(getattr(base, name))
+        assert name in rbln.__dict__, f"{rbln.__name__} inherits upstream's {name}"
 
 
 def test_prepare_prefill_inputs_copies_prompt_chunks_and_next_token():
@@ -66,7 +112,7 @@ def test_prepare_prefill_inputs_copies_prompt_chunks_and_next_token():
     input_ids = torch.full((8,), -1, dtype=torch.int32)
     next_prefill = torch.full((MAX_REQS,), -1, dtype=torch.int32)
 
-    ib.prepare_prefill_inputs(
+    ops.prepare_prefill_inputs(
         input_ids,
         next_prefill,
         idx_mapping,
@@ -91,7 +137,7 @@ def test_prepare_pos_seq_lens_and_padding():
     pos = torch.zeros(8, dtype=torch.int64)
     seq_lens = torch.full((MAX_REQS,), 99, dtype=torch.int32)
 
-    ib.prepare_pos_seq_lens(idx_mapping, query_start_loc, num_computed, pos, seq_lens)
+    ops.prepare_pos_seq_lens(idx_mapping, query_start_loc, num_computed, pos, seq_lens)
 
     assert pos[:4].tolist() == [10, 11, 12, 20]
     assert seq_lens.tolist() == [13, 21] + [0] * (MAX_REQS - 2)
@@ -113,7 +159,7 @@ def test_combine_sampled_and_draft_tokens(with_drafts):
         cu_num_logits = _i32([0, 3, 4])
         seq_lens = _i32([20, 4])
         input_ids = torch.full((4,), -1, dtype=torch.int32)
-        logits_indices = ib.combine_sampled_and_draft_tokens(
+        logits_indices = ops.combine_sampled_and_draft_tokens(
             input_ids,
             idx_mapping,
             last_sampled,
@@ -123,6 +169,7 @@ def test_combine_sampled_and_draft_tokens(with_drafts):
             draft_tokens,
             cu_num_logits,
             4,
+            1,
         )
         assert logits_indices.tolist() == [0, 1, 2, 3]
         assert input_ids.tolist() == [111, 31, 32, -1]
@@ -131,7 +178,7 @@ def test_combine_sampled_and_draft_tokens(with_drafts):
         cu_num_logits = _i32([0, 1, 2])
         seq_lens = _i32([20, 21])
         input_ids = torch.full((2,), -1, dtype=torch.int32)
-        logits_indices = ib.combine_sampled_and_draft_tokens(
+        logits_indices = ops.combine_sampled_and_draft_tokens(
             input_ids,
             idx_mapping,
             last_sampled,
@@ -141,18 +188,19 @@ def test_combine_sampled_and_draft_tokens(with_drafts):
             draft_tokens,
             cu_num_logits,
             2,
+            1,
         )
         assert logits_indices.tolist() == [0, 1]
         assert input_ids.tolist() == [111, 222]
 
 
-def test_get_num_sampled_and_rejected_zeroes_chunked_prefills():
+def test_num_sampled_and_rejected_zeroes_chunked_prefills():
     num_sampled = _i32([1, 1, 2])
     seq_lens = _i32([3, 10, 12])
     cu_num_logits = _i32([0, 1, 2, 5])
     idx_mapping = _i32([0, 1, 2])
     prefill_len = _i32([5, 5, 5, 0, 0, 0, 0, 0])
-    sampled, rejected = ib.get_num_sampled_and_rejected(
+    sampled, rejected = ops.num_sampled_and_rejected(
         num_sampled, seq_lens, cu_num_logits, idx_mapping, prefill_len
     )
     assert sampled.tolist() == [0, 1, 2]
@@ -173,7 +221,7 @@ def test_post_update_appends_tokens_and_advances_state():
     total_len = torch.zeros(MAX_REQS, dtype=torch.int32)
     total_len[[2, 5]] = _i32([10, 12])
 
-    ib.post_update(
+    ops.post_update(
         idx_mapping,
         num_computed,
         last_sampled,
@@ -195,11 +243,14 @@ def test_post_update_appends_tokens_and_advances_state():
     assert bin_counts[5, 7].item() == 1
     assert bin_counts.sum().item() == 3  # the -1 row was skipped
 
+    ops.post_update_num_computed_tokens(_i32([2]), num_computed, _i32([0, 4]))
+    assert num_computed[2].item() == 7 + 3 - 1 + 4
+
 
 def test_expand_idx_mapping():
     idx_mapping = _i32([4, 1])
     cu_num_logits = _i32([0, 3, 4])
-    expanded, local_pos = ib.expand_idx_mapping(idx_mapping, 4, cu_num_logits, 3)
+    expanded, local_pos = ops.expand_idx_mapping(idx_mapping, 4, cu_num_logits, 3)
     assert expanded.tolist() == [4, 4, 4, 1]
     assert local_pos.tolist() == [0, 1, 2, 0]
 
@@ -208,12 +259,12 @@ def test_apply_temperature_and_min_p():
     logits = torch.tensor([[2.0, 4.0, 0.0], [2.0, 4.0, 0.0], [2.0, 4.0, 0.0]])
     eim = _i32([0, 1, 2])
     temperature = torch.tensor([2.0, 1.0, 0.0])
-    apply_temperature(logits, eim, temperature)
+    ops.apply_temperature(logits, eim, temperature)
     assert logits.tolist() == [[1.0, 2.0, 0.0], [2.0, 4.0, 0.0], [2.0, 4.0, 0.0]]
 
     logits = torch.tensor([[0.0, 4.0, 3.0], [0.0, 4.0, 3.0]])
     min_p = torch.tensor([0.3, 0.0])  # threshold 4 + log(0.3) ~ 2.8
-    apply_min_p(logits, eim[:2], min_p)
+    ops.apply_min_p(logits, eim[:2], min_p)
     assert logits[0].tolist() == [float("-inf"), 4.0, 3.0]
     assert logits[1].tolist() == [0.0, 4.0, 3.0]
 
@@ -225,15 +276,15 @@ def test_gumbel_sample_greedy_argmax_and_seeded_determinism():
     temperature = torch.tensor([0.0, 1.0, 1.0])
     seeds = _i64([0, 123, 123])
     pos = _i64([5, 7, 7])
-    first = gumbel_sample(
-        logits.clone(), eim, temperature, seeds, pos, apply_temperature=True
-    )
-    second = gumbel_sample(
-        logits.clone(), eim, temperature, seeds, pos, apply_temperature=True
-    )
-    assert first[0].item() == logits[0].argmax().item()
-    assert first.tolist() == second.tolist()
-    assert first[1].item() == first[2].item()  # same seed, position and logits
+    draws = [
+        ops.gumbel_sample(
+            logits.clone(), eim, temperature, seeds, pos, True, None, None, False
+        )
+        for _ in range(2)
+    ]
+    assert draws[0][0].item() == logits[0].argmax().item()
+    assert draws[0].tolist() == draws[1].tolist()
+    assert draws[0][1].item() == draws[0][2].item()  # same seed, position, logits
 
 
 def test_penalties_match_reference():
@@ -245,7 +296,7 @@ def test_penalties_match_reference():
     prefill_len = _i32([0, 6])
     prompt_bin_mask = torch.zeros(req_states, (vocab + 31) // 32, dtype=torch.int32)
     output_bin_counts = torch.zeros(req_states, vocab, dtype=torch.int32)
-    bincount(
+    ops.bincount(
         _i32([1]),
         all_token_ids,
         prompt_len,
@@ -268,7 +319,7 @@ def test_penalties_match_reference():
     expected = expected * torch.where(expected > 0, 1.0 / scale, scale)
     expected = expected - freq * counts - pres * (counts > 0).float()
 
-    apply_penalties(
+    ops.apply_penalties(
         logits,
         _i32([1]),
         _i32([0]),
@@ -298,7 +349,7 @@ def test_logit_bias_allowed_bias_and_min_tokens():
     num_stop = _i32([0, 1])
     stop_tok = torch.zeros(2, 4, dtype=torch.int32)
     stop_tok[1, 0] = 1
-    apply_logit_bias(
+    ops.apply_logit_bias(
         logits,
         eim,
         pos,
@@ -332,7 +383,7 @@ def test_bad_words_masks_completion_of_matching_prefix():
     all_token_ids[3, :6] = _i32([1, 1, 1, 1, 10, 11])  # prompt 4, output [10, 11]
     prompt_len = torch.full((MAX_REQS,), 4, dtype=torch.int32)
     total_len = torch.full((MAX_REQS,), 6, dtype=torch.int32)
-    apply_bad_words(
+    ops.apply_bad_words(
         logits,
         eim,
         bw_tok,
@@ -349,21 +400,37 @@ def test_bad_words_masks_completion_of_matching_prefix():
     assert torch.isfinite(logits[0, 21])  # [20] does not precede
 
 
-def test_topk_scores_match_log_softmax():
+def test_token_logprobs_ranks_and_logprob_token_ids():
     logits = torch.randn(3, VOCAB)
     sampled = logits.argmax(-1)
-    out = compute_topk_scores(logits, 2, sampled)
+    topk = torch.topk(logits, 2, dim=-1).indices.to(torch.int32)
+    token_ids = torch.cat([sampled.view(-1, 1), topk], dim=1)
     ref = torch.log_softmax(logits, -1)
-    torch.testing.assert_close(out.logprobs, ref.gather(1, out.logprob_token_ids))
-    assert out.selected_token_ranks.tolist() == [1, 1, 1]
-    assert out.logprob_token_ids[:, 0].tolist() == sampled.tolist()
+    torch.testing.assert_close(
+        ops.token_logprobs(logits, token_ids), ref.gather(1, token_ids)
+    )
+    assert ops.token_ranks(logits, sampled).tolist() == [1, 1, 1]
+
+    # row 1 asked for its own two token ids, the others take the top-k
+    out = torch.zeros(3, 3, dtype=torch.int64)
+    valid = torch.zeros(3, 3, dtype=torch.bool)
+    per_req = torch.zeros(MAX_REQS, 4, dtype=torch.int32)
+    per_req[6, :2] = _i32([40, 41])
+    num_per_req = _i32([0] * MAX_REQS)
+    num_per_req[6] = 2
+    ops.fill_logprob_token_ids(
+        out, valid, sampled, topk, _i32([0, 6, 1]), num_per_req, per_req, 2
+    )
+    assert out[:, 0].tolist() == sampled.tolist()
+    assert out[0, 1:].tolist() == topk[0].tolist() and out[1, 1:].tolist() == [40, 41]
+    assert valid.all()
 
 
 def test_prompt_logprobs_token_ids_and_num_nans():
     all_token_ids = torch.arange(MAX_REQS * MAX_LEN, dtype=torch.int32).view(
         MAX_REQS, MAX_LEN
     )
-    ids = get_prompt_logprobs_token_ids(
+    ids = ops.prompt_logprobs_token_ids(
         3, _i32([0, 2, 3]), _i32([1, 4]), _i32([0, 5, 0, 0, 9]), all_token_ids
     )
     assert ids.tolist() == [
@@ -374,7 +441,7 @@ def test_prompt_logprobs_token_ids_and_num_nans():
 
     logits = torch.zeros(2, 5)
     logits[1, [0, 3]] = float("nan")
-    assert get_num_nans(logits).tolist() == [0, 2]
+    assert ops.num_nans(logits).tolist() == [0, 2]
 
 
 def test_grammar_bitmask_masks_cleared_bits():
@@ -383,16 +450,14 @@ def test_grammar_bitmask_masks_cleared_bits():
     bitmask[0, 0] = (
         0b101  # tokens 0 and 2 allowed in the first word, none in the second
     )
-    _apply_grammar_bitmask_kernel[(1, 1)](
-        logits, logits.stride(0), _i32([2]), bitmask, bitmask.stride(0), 40
-    )
+    ops.apply_grammar_bitmask(logits, _i32([2]), bitmask)
     assert torch.isfinite(logits[0]).all() and torch.isfinite(logits[1]).all()
     assert logits[2, 0] == 0 and logits[2, 2] == 0
     assert torch.isinf(logits[2]).sum().item() == 38
 
 
 @pytest.mark.maybe_use_device
-def test_staged_write_tensor_flushes_rows():
+def test_staged_write_tensor_flushes_rows_without_triton():
     from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
 
     device = torch.device("cpu")
@@ -432,8 +497,6 @@ def _rejection_inputs(num_reqs, cu, temps, seeds=None):
 
 
 def test_rejection_sample_greedy_accepts_matching_prefix():
-    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rs
-
     # req 0: drafts [3, 7] with target argmax [3, 9, 5] -> accept 3, recover 9
     # req 1: drafts [1] fully accepted -> bonus argmax 4 appended
     # req 2: no drafts -> plain bonus 2
@@ -445,7 +508,7 @@ def test_rejection_sample_greedy_accepts_matching_prefix():
     cu_num_logits, idx_mapping, expanded_idx, expanded_pos, temperature, seed, pos = (
         _rejection_inputs(3, cu, [0.0, 0.0, 0.0])
     )
-    sampled, num_sampled = rs.rejection_sample(
+    sampled, num_sampled = ops.rejection_sample_logits(
         logits,
         None,
         draft_sampled,
@@ -456,7 +519,8 @@ def test_rejection_sample_greedy_accepts_matching_prefix():
         expanded_pos,
         temperature,
         seed,
-        num_speculative_steps=2,
+        2,
+        False,
     )
     assert num_sampled.tolist() == [2, 2, 1]
     assert sampled[0, :2].tolist() == [3, 9]
@@ -465,8 +529,6 @@ def test_rejection_sample_greedy_accepts_matching_prefix():
 
 
 def test_rejection_sample_random_never_resamples_rejected_draft():
-    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rs
-
     # Target puts no mass on the draft token, so every seed rejects it, and
     # the recovered token must come from the residual: anything but 7.
     cu = [0, 2]
@@ -483,7 +545,7 @@ def test_rejection_sample_random_never_resamples_rejected_draft():
             seed,
             pos,
         ) = _rejection_inputs(1, cu, [1.0], seeds=[s] * MAX_REQS)
-        sampled, num_sampled = rs.rejection_sample(
+        sampled, num_sampled = ops.rejection_sample_logits(
             logits,
             None,
             draft_sampled,
@@ -494,44 +556,36 @@ def test_rejection_sample_random_never_resamples_rejected_draft():
             expanded_pos,
             temperature,
             seed,
-            num_speculative_steps=1,
+            1,
+            False,
         )
         assert num_sampled.tolist() == [1]
         assert sampled[0, 0].item() != 7
 
 
 def test_flatten_sampled_places_each_request_at_its_logit_offset():
-    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rs
-
     sampled = _i64([[10, 11, 12], [20, 21, 22]])
-    num_sampled = _i32([2, 1])
-    cu_num_logits = _i32([0, 3, 6])
     flat = torch.zeros(6, dtype=torch.int64)
-    rs._flatten_sampled_kernel[(2,)](
-        flat, sampled, sampled.stride(0), num_sampled, cu_num_logits, num_warps=1
-    )
+    ops.flatten_sampled(flat, sampled, _i32([2, 1]), _i32([0, 3, 6]))
     assert flat.tolist() == [10, 11, 0, 20, 0, 0]
 
 
 def test_draft_prefill_inputs_shift_tokens_and_place_next_token():
     from vllm.v1.worker.gpu.input_batch import InputBuffers
-    from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as sp
 
     # req 0: 4 target tokens, 1 rejected -> draft consumes 3; req 1: 2 tokens.
     buffers = InputBuffers(max_num_reqs=MAX_REQS, max_num_tokens=16, device="cpu")
-    target_ids = _i32([10, 11, 12, 13, 20, 21])
-    target_pos = _i64([5, 6, 7, 8, 0, 1])
     last_token_indices = torch.zeros(MAX_REQS, dtype=torch.int64)
     step = torch.tensor(7)
-    sp._prepare_prefill_inputs_kernel[(2,)](
+    ops.draft_prepare_prefill_inputs(
         last_token_indices,
         step,
         buffers.input_ids,
         buffers.positions,
         buffers.query_start_loc,
         buffers.seq_lens,
-        target_ids,
-        target_pos,
+        _i32([10, 11, 12, 13, 20, 21]),  # target input ids
+        _i64([5, 6, 7, 8, 0, 1]),  # target positions
         _i32([3, 1]),  # idx_mapping
         _i64([[0], [0], [0], [99], [0], [0], [0], [0]]),  # last_sampled per state
         _i32([0, 55, 0, 0, 0, 0, 0, 0]),  # next_prefill_tokens per state
@@ -540,7 +594,6 @@ def test_draft_prefill_inputs_shift_tokens_and_place_next_token():
         _i32([0, 4, 6]),  # query_start_loc
         _i32([9, 2]),  # seq_lens
         MAX_REQS,
-        BLOCK_SIZE=1024,
     )
     assert buffers.input_ids[:6].tolist() == [11, 12, 99, 0, 21, 55]
     assert last_token_indices[:2].tolist() == [2, 5]
@@ -552,14 +605,12 @@ def test_draft_prefill_inputs_shift_tokens_and_place_next_token():
 
 def test_draft_decode_and_update_inputs_advance_positions():
     from vllm.v1.worker.gpu.input_batch import InputBuffers
-    from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as sp
 
     buffers = InputBuffers(max_num_reqs=MAX_REQS, max_num_tokens=16, device="cpu")
     buffers.positions[:2] = _i64([7, 30])
     draft_tokens = _i64([[3, 0], [4, 0]])
-    sp._prepare_decode_inputs_kernel[(3,)](
+    ops.draft_prepare_decode_inputs(
         draft_tokens[:, 0],
-        draft_tokens.stride(0),
         _i32([9, 31]),  # target seq_lens
         _i32([1, 0]),  # num_rejected
         buffers.input_ids,
@@ -568,8 +619,7 @@ def test_draft_decode_and_update_inputs_advance_positions():
         buffers.seq_lens,
         32,  # max_model_len
         MAX_REQS,
-        BLOCK_SIZE=1024,
-        ADVANCE_DRAFT_POSITIONS=True,
+        True,
     )
     assert buffers.input_ids[:2].tolist() == [3, 4]
     assert buffers.positions[:2].tolist() == [8, 31]  # clamped to max_model_len - 1
@@ -579,23 +629,18 @@ def test_draft_decode_and_update_inputs_advance_positions():
     hidden = torch.arange(2 * 4, dtype=torch.float32).view(2, 4)
     next_hidden = torch.zeros(MAX_REQS, 4)
     step = torch.tensor(0)
-    sp._update_draft_inputs_kernel[(2,)](
+    ops.draft_update_inputs(
         draft_tokens,
-        draft_tokens.stride(0),
         next_hidden,
-        next_hidden.stride(0),
         buffers.input_ids,
         buffers.positions,
         buffers.seq_lens,
-        _i64([5, 6]),  # this step's draft tokens
+        _i64([5, 6]),
         step,
         hidden,
-        hidden.stride(0),
-        4,
         32,
         2,
-        BLOCK_SIZE=1024,
-        ADVANCE_DRAFT_POSITIONS=True,
+        True,
     )
     assert draft_tokens[:, 0].tolist() == [5, 6]
     assert buffers.input_ids[:2].tolist() == [5, 6]

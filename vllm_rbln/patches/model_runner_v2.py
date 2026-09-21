@@ -16,8 +16,7 @@
 torch build cannot run: the PP sampled-token broadcast, which upstream runs
 on a side stream over a sibling NCCL group, and the draft-token hand-off,
 which calls `Tensor.record_stream`. The runner's Triton kernels are not
-patched: `vllm_rbln.v1.worker.v2_kernels` serves them through
-`Platform.get_kernel_impl`.
+patched: the `vllm_rbln.v2` components override upstream's kernel methods.
 """
 
 from collections import deque

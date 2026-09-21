@@ -45,6 +45,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_rbln import envs
 from vllm_rbln.compilation import (
@@ -63,7 +64,6 @@ from vllm_rbln.v1.attention.kv_cache_bindings import attach_kv_cache_bindings
 from vllm_rbln.v1.core.rbln_kv_cache_manager import KVCacheCopyOp
 from vllm_rbln.v1.core.rbln_scheduler import RBLNSchedulerOutput
 from vllm_rbln.v1.core.utils import decode_batch_size, step_is_prefill
-from vllm_rbln.v1.spec_decode.eagle_v2 import RBLNEagleSpeculator
 from vllm_rbln.v1.worker import mega_cache
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
 from vllm_rbln.v1.worker.dp_utils import (
@@ -78,6 +78,11 @@ from vllm_rbln.v1.worker.utils import (
     make_weights_contiguous,
 )
 from vllm_rbln.v1.worker.utils import num_attn_module as rbln_num_attn_module
+from vllm_rbln.v2.spec_decode.eagle import RBLNEagleSpeculator
+from vllm_rbln.v2.worker.prompt_logprobs import RBLNPromptLogprobsWorker
+from vllm_rbln.v2.worker.rejection_sampler import RBLNRejectionSamplerV2
+from vllm_rbln.v2.worker.sampler import RBLNSamplerV2
+from vllm_rbln.v2.worker.structured_outputs import RBLNStructuredOutputsWorker
 
 logger = init_logger(__name__)
 
@@ -184,6 +189,54 @@ class RBLNModelRunnerV2(GPUModelRunner):
     def init_speculator(self) -> RBLNEagleSpeculator:
         return RBLNEagleSpeculator(self.vllm_config, self.device, self)
 
+    def init_sampler(self) -> RBLNSamplerV2:
+        return RBLNSamplerV2(
+            max_num_reqs=self.max_num_reqs,
+            vocab_size=self.vocab_size,
+            device=self.device,
+            req_states=self.req_states,
+            logprobs_mode=self.model_config.logprobs_mode,
+            num_speculative_tokens=self.decode_query_len,
+            use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+        )
+
+    def init_rejection_sampler(self, sampler: Sampler) -> RBLNRejectionSamplerV2:
+        assert self.speculative_config is not None
+        return RBLNRejectionSamplerV2(sampler, self.speculative_config, self.device)
+
+    def init_prompt_logprobs_worker(self, sampler: Sampler) -> RBLNPromptLogprobsWorker:
+        return RBLNPromptLogprobsWorker(
+            self.max_num_reqs, sampler, logprobs_mode=self.model_config.logprobs_mode
+        )
+
+    def init_structured_outputs_worker(self) -> RBLNStructuredOutputsWorker:
+        return RBLNStructuredOutputsWorker(
+            max_num_logits=self.max_num_reqs * self.decode_query_len,
+            vocab_size=self.vocab_size,
+            device=self.device,
+        )
+
+    # The runner's kernels over the request state and input buffers, as
+    # `rbln::` custom ops.
+
+    def prepare_prefill_inputs(self, *args: Any) -> None:
+        torch.ops.rbln.prepare_prefill_inputs(*args)
+
+    def prepare_pos_seq_lens(self, *args: Any) -> None:
+        torch.ops.rbln.prepare_pos_seq_lens(*args)
+
+    def combine_sampled_and_draft_tokens(self, *args: Any) -> torch.Tensor:
+        return torch.ops.rbln.combine_sampled_and_draft_tokens(*args)
+
+    def expand_idx_mapping(self, *args: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.rbln.expand_idx_mapping(*args)
+
+    def post_update(self, *args: Any) -> None:
+        torch.ops.rbln.post_update(*args)
+
+    def post_update_num_computed_tokens(self, *args: Any) -> None:
+        torch.ops.rbln.post_update_num_computed_tokens(*args)
+
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         with self.offload_context():
             super().load_model(load_dummy_weights, *args, **kwargs)
@@ -210,11 +263,12 @@ class RBLNModelRunnerV2(GPUModelRunner):
                 return model_output, None
             # eagle3's aux states leave the graph as one concatenated tensor:
             # a list of outputs that alias each other does not compile.
+            aux: tuple[torch.Tensor, ...] = ()
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = model_output
                 aux = (torch.cat(aux_hidden_states, dim=-1),)
             else:
-                hidden_states, aux = model_output, ()
+                hidden_states = model_output
             sample_hidden_states = hidden_states
             if token_indices is not None:
                 sample_hidden_states = hidden_states[:, token_indices]
@@ -550,7 +604,11 @@ class RBLNModelRunnerV2(GPUModelRunner):
             model_output, _ = outputs
             assert isinstance(model_output, IntermediateTensors)
             return model_output
-        self._step_logits, hidden_states, *aux_hidden_states = outputs
+        if self.is_pooling_model:
+            hidden_states, _ = outputs
+            aux_hidden_states = []
+        else:
+            self._step_logits, hidden_states, *aux_hidden_states = outputs
 
         def flat(rows: torch.Tensor) -> torch.Tensor:
             # Upstream reads num_tokens_after_padding rows in flat token order.

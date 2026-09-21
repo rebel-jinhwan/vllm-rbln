@@ -14,13 +14,13 @@
 
 """EAGLE drafting for RBLNModelRunnerV2 on upstream's V2 speculator.
 
-Upstream's ``AutoRegressiveSpeculator`` owns the drafting loop, its input
-kernels (served by ``v2_kernels``) and draft sampling. This class overrides
-its hardware seams: ``dispatch_batch`` picks the compiled shape, ``_run_model``
-stages a pass into the compiled draft graph, and ``_build_draft_attn_metadata``
-calls the RBLN builder. Upstream keeps tokens in flat token order; the graph
-runs on padded ``[num_reqs, query_len]`` rows, so ``_run_model`` converts
-between the two on the way in and out.
+Upstream's ``AutoRegressiveSpeculator`` owns the drafting loop and draft
+sampling. This class overrides its hardware seams: ``dispatch_batch`` picks
+the compiled shape, ``_run_model`` stages a pass into the compiled draft
+graph, ``_build_draft_attn_metadata`` calls the RBLN builder, and the kernel
+methods call ``rbln::`` ops. Upstream keeps tokens in flat token order; the
+graph runs on padded ``[num_reqs, query_len]`` rows, so ``_run_model``
+converts between the two on the way in and out.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -40,7 +40,7 @@ from vllm_rbln.v1.worker.dp_utils import determine_draft_batch_execution_and_pad
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager
 
 if TYPE_CHECKING:
-    from vllm_rbln.v1.worker.rbln_model_runner_v2 import RBLNModelRunnerV2
+    from vllm_rbln.v2.worker.model_runner import RBLNModelRunnerV2
 
 
 class RBLNEagleSpeculator(EagleSpeculator):
@@ -74,6 +74,114 @@ class RBLNEagleSpeculator(EagleSpeculator):
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
+
+    # Upstream's kernels over the draft's input buffers, as `rbln::` custom ops.
+
+    def prepare_prefill_inputs(  # type: ignore[override]
+        self,
+        last_token_indices,
+        current_draft_step,
+        input_buffers,
+        input_batch,
+        num_sampled,
+        num_rejected,
+        last_sampled,
+        next_prefill_tokens,
+        max_num_reqs,
+    ) -> torch.Tensor:
+        torch.ops.rbln.draft_prepare_prefill_inputs(
+            last_token_indices,
+            current_draft_step,
+            input_buffers.input_ids,
+            input_buffers.positions,
+            input_buffers.query_start_loc,
+            input_buffers.seq_lens,
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.idx_mapping,
+            last_sampled,
+            next_prefill_tokens,
+            num_sampled,
+            num_rejected,
+            input_batch.query_start_loc,
+            input_batch.seq_lens,
+            max_num_reqs,
+        )
+        return last_token_indices
+
+    def prepare_decode_inputs(  # type: ignore[override]
+        self,
+        draft_tokens,
+        target_seq_lens,
+        num_rejected,
+        input_buffers,
+        max_model_len,
+        max_num_reqs,
+        advance_draft_positions=True,
+    ) -> None:
+        torch.ops.rbln.draft_prepare_decode_inputs(
+            draft_tokens,
+            target_seq_lens,
+            num_rejected,
+            input_buffers.input_ids,
+            input_buffers.positions,
+            input_buffers.query_start_loc,
+            input_buffers.seq_lens,
+            max_model_len,
+            max_num_reqs,
+            advance_draft_positions,
+        )
+
+    def update_draft_inputs(  # type: ignore[override]
+        self,
+        draft_tokens,
+        current_draft_step,
+        hidden_states,
+        output_draft_tokens,
+        next_input_hidden_states,
+        input_buffers,
+        num_reqs,
+        max_model_len,
+        num_speculative_steps,
+        advance_draft_positions=True,
+    ) -> None:
+        torch.ops.rbln.draft_update_inputs(
+            output_draft_tokens,
+            next_input_hidden_states,
+            input_buffers.input_ids,
+            input_buffers.positions,
+            input_buffers.seq_lens,
+            draft_tokens[:num_reqs],
+            current_draft_step,
+            hidden_states,
+            max_model_len,
+            num_speculative_steps,
+            advance_draft_positions,
+        )
+
+    def gumbel_sample(  # type: ignore[override]
+        self,
+        logits,
+        expanded_idx_mapping,
+        temperature,
+        seed,
+        pos,
+        apply_temperature,
+        output_processed_logits=None,
+        output_processed_logits_col=None,
+        use_fp64=False,
+    ) -> torch.Tensor:
+        return torch.ops.rbln.gumbel_sample(
+            logits,
+            expanded_idx_mapping,
+            temperature,
+            seed,
+            pos,
+            apply_temperature,
+            output_processed_logits,
+            output_processed_logits_col,
+            use_fp64,
+        )
 
     def capture(self) -> None:
         pass
