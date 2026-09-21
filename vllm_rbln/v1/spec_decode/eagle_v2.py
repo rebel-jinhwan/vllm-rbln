@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EAGLE drafting for RBLNModelRunnerV2 on upstream's V2 speculator interface.
+"""EAGLE drafting for RBLNModelRunnerV2 on upstream's V2 speculator.
 
-Upstream's AutoRegressiveSpeculator drives the draft model eagerly on flat
-token buffers. RBLN runs it as compiled per-shape graphs on the padded
-``[num_reqs, query_len]`` rows the target step staged, so ``propose`` is
-rewritten on that layout while model loading, weight sharing and the buffers
-stay the base class's.
+Upstream's ``AutoRegressiveSpeculator`` owns the drafting loop, its input
+kernels (served by ``v2_kernels``) and draft sampling. This class overrides
+its hardware seams: ``dispatch_batch`` picks the compiled shape, ``_run_model``
+stages a pass into the compiled draft graph, and ``_build_draft_attn_metadata``
+calls the RBLN builder. Upstream keeps tokens in flat token order; the graph
+runs on padded ``[num_reqs, query_len]`` rows, so ``_run_model`` converts
+between the two on the way in and out.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -28,7 +30,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
 from vllm_rbln import envs
@@ -65,7 +67,10 @@ class RBLNEagleSpeculator(EagleSpeculator):
             )
         self.runner = runner
         self.input_stager = InputStager(device)
-        self.draft_id_to_target_id: torch.Tensor | None = None
+        # Set by dispatch_batch for the pass that follows it.
+        self._decode_pass = False
+        self._num_reqs_padded = 0
+        self._num_padded_tokens: int | None = None
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -76,31 +81,21 @@ class RBLNEagleSpeculator(EagleSpeculator):
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
         hidden_size = self.hidden_size
-        d2t = getattr(self.model, "draft_id_to_target_id", None)
-        self.draft_id_to_target_id = None if d2t is None else d2t.cpu()
 
         def model_wrapper(
             input_ids: torch.Tensor,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
-            token_indices: torch.Tensor | None = None,
         ):
             ret = self.model(
                 input_ids=input_ids, positions=positions, hidden_states=hidden_states
             )
             last_hidden, hidden = ret if isinstance(ret, tuple) else (ret, ret)
-            hidden = hidden.view(-1, hidden_size)
-            sample_hidden = last_hidden.view(-1, hidden_size)
-            if token_indices is not None:
-                hidden = hidden[token_indices]
-                sample_hidden = sample_hidden[token_indices]
-            if self.draft_id_to_target_id is None:
-                logits = self.model.compute_logits(sample_hidden)
-            else:
-                # Draft-vocabulary logits; compute_logits would scatter them
-                # into the target vocabulary, which _to_target_ids does instead.
-                logits = self.model.logits_processor(self.model.lm_head, sample_hidden)
-            return hidden, torch.ops.rbln.argmax(logits)
+            if last_hidden is hidden:
+                # EAGLE returns one tensor twice; two aliased graph outputs
+                # do not compile, so the pair is rebuilt in _run_model.
+                return last_hidden.view(-1, hidden_size)
+            return last_hidden.view(-1, hidden_size), hidden.view(-1, hidden_size)
 
         rbln_config = self.runner.rbln_config
         if self.speculative_config.enforce_eager or not rbln_config.compile_model:
@@ -120,180 +115,119 @@ class RBLNEagleSpeculator(EagleSpeculator):
             use_direct_dispatch=True,
         )
 
-    def propose(  # type: ignore[override]
+    def dispatch_batch(  # type: ignore[override]
         self,
-        input_batch: InputBatch,
-        attn_metadata: dict[str, Any],
-        slot_mappings: dict[str, torch.Tensor],
-        last_hidden_states: torch.Tensor,
-        aux_hidden_states: list[torch.Tensor] | None,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
-        last_sampled: torch.Tensor,
-        next_prefill_tokens: torch.Tensor,
-        temperature: torch.Tensor,
-        seeds: torch.Tensor,
-        num_tokens_across_dp: torch.Tensor | None = None,
-        dummy_run: bool = False,
-        skip_attn_for_dummy_run: bool = False,
-        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
-        is_profile: bool = False,
-    ) -> torch.Tensor:
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        *,
+        decode: bool,
+        need_eager: bool,
+        **kwargs: Any,
+    ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
         runner = self.runner
-        step = runner.step_shape
-        assert step is not None
-        layout = step.layout
-        num_reqs = input_batch.num_reqs
-        query_len = layout.query_len
-        device = self.device
-
-        # The draft consumes the step's tokens minus the rejected tail, shifted
-        # one to the left, with the token the target sampled last in the slot
-        # the target's last accepted hidden state occupies.
-        num_input = (
-            input_batch.num_scheduled_tokens[:num_reqs] - num_rejected.cpu().numpy()
-        )
-        last = step.front_pad + num_input - 1
-        cols = np.arange(query_len)
-        idx = input_batch.idx_mapping.long()
-        next_tokens = torch.where(
-            num_sampled[:num_reqs] > 0,
-            last_sampled[idx].view(-1).to(step.input_ids.dtype),
-            next_prefill_tokens[idx].to(step.input_ids.dtype),
-        )
-        draft_ids = torch.gather(
-            step.input_ids,
-            1,
-            torch.from_numpy(np.minimum(cols[None, :] + 1, last[:, None])).to(device),
-        )
-        draft_ids = torch.where(
-            torch.from_numpy(cols[None, :] >= last[:, None]).to(device),
-            next_tokens[:, None],
-            draft_ids,
-        )
-        if step.hidden_states is not None:
-            last_hidden_states = step.hidden_states
-        hidden = last_hidden_states.view(
-            layout.num_reqs_padded, layout.query_len_padded, -1
-        )[:num_reqs, :query_len]
-        token_indices = torch.from_numpy(
-            (np.arange(num_reqs) * layout.query_len_padded + last).astype(np.int32)
-        )
-        seq_lens = input_batch.num_computed_tokens_np[:num_reqs] + num_input
-        hidden, ids = self._run(
-            draft_ids,
-            step.positions,
-            hidden,
-            token_indices,
-            layout,
-            seq_lens,
-            step.block_tables,
-            runner.is_prefill,
-            num_reqs * query_len,
-            first_pass=True,
-        )
-        ids = self._to_target_ids(ids[:num_reqs])
-        self.draft_tokens[:num_reqs, 0] = ids
-        if self.num_speculative_steps == 1:
-            return self.draft_tokens[:num_reqs, :1]
-
-        positions = step.positions[np.arange(num_reqs), last]
-        for draft_step in range(1, self.num_speculative_steps):
-            positions = np.minimum(positions + 1, self.max_model_len - 1)
-            seq_lens = np.minimum(seq_lens + 1, self.max_model_len)
-            batch_desc, _ = self._batch(num_reqs, num_reqs, False, first_pass=False)
-            hidden, ids = self._run(
-                ids.view(-1, 1).to(step.input_ids.dtype),
-                positions[:, None],
-                hidden[:num_reqs].unsqueeze(1),
-                None,
-                InputLayout(
-                    num_reqs=num_reqs,
-                    num_reqs_padded=batch_desc.num_reqs_padded,
-                    query_len=1,
-                    query_len_padded=1,
-                ),
-                seq_lens,
-                step.block_tables,
-                False,
-                num_reqs,
-                first_pass=False,
-            )
-            ids = self._to_target_ids(ids[:num_reqs])
-            self.draft_tokens[:num_reqs, draft_step] = ids
-        return self.draft_tokens[:num_reqs]
-
-    def _to_target_ids(self, draft_ids: torch.Tensor) -> torch.Tensor:
-        """`draft_id_to_target_id` holds offsets: upstream scatters draft logits
-        at `arange(draft_vocab) + d2t` before its argmax, and for that monotonic
-        mapping argmax-then-offset picks the same token."""
-        if self.draft_id_to_target_id is None:
-            return draft_ids
-        draft_ids = draft_ids.cpu()
-        return (draft_ids + self.draft_id_to_target_id[draft_ids]).to(self.device)
-
-    def _batch(
-        self, num_reqs: int, num_tokens: int, is_prefill: bool, *, first_pass: bool
-    ):
         dp_size = self.vllm_config.parallel_config.data_parallel_size
-        return determine_draft_batch_execution_and_padding(
-            cfg=self.runner.shape_config,
-            status=None if dp_size == 1 else self.runner.dp_status,
+        batch_desc, num_tokens_across_dp = determine_draft_batch_execution_and_padding(
+            cfg=runner.shape_config,
+            status=None if dp_size == 1 else runner.dp_status,
             dp_rank=self.dp_rank,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
-            is_prefill=is_prefill,
+            is_prefill=runner.is_prefill and not decode,
             draft_has_moe=False,
-            first_pass=first_pass,
+            first_pass=not decode,
+        )
+        self._decode_pass = decode
+        self._num_reqs_padded = batch_desc.num_reqs_padded
+        self._num_padded_tokens = batch_desc.num_tokens_padded
+        return (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=batch_desc.num_reqs_padded,
+                uniform_token_count=uniform_token_count,
+            ),
+            num_tokens_across_dp,
         )
 
-    def _run(
+    def _run_model(  # type: ignore[override]
         self,
-        input_ids: torch.Tensor,
-        positions: np.ndarray,
-        hidden_states: torch.Tensor,
-        token_indices: torch.Tensor | None,
-        layout: InputLayout,
-        seq_lens: np.ndarray,
-        block_tables: tuple[torch.Tensor, ...],
-        is_prefill: bool,
         num_tokens: int,
-        *,
-        first_pass: bool,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_desc, num_tokens_across_dp = self._batch(
-            layout.num_reqs, num_tokens, is_prefill, first_pass=first_pass
-        )
-        positions = positions.astype(np.int64)
-        attn_metadata = self.runner.rbln_attn_metadata(
-            self.attn_groups,
-            layout.num_reqs,
-            layout.num_reqs_padded,
-            torch.from_numpy(
-                np.arange(layout.num_reqs + 1, dtype=np.int32) * layout.query_len
-            ),
-            torch.from_numpy(seq_lens.astype(np.int32)),
-            torch.from_numpy(positions.reshape(-1)),
-            block_tables,
-            is_prefill,
-        )
+        if self._decode_pass:
+            # One token per request: the flat order is the row order.
+            num_reqs = num_tokens
+            layout = InputLayout(
+                num_reqs=num_reqs,
+                num_reqs_padded=self._num_reqs_padded,
+                query_len=1,
+                query_len_padded=1,
+            )
+            token_rows = None
+            positions = self.input_buffers.positions[:num_reqs].view(num_reqs, 1)
+            input_ids = self.input_buffers.input_ids[:num_reqs].view(num_reqs, 1)
+            hidden_states = self.hidden_states[:num_reqs].view(num_reqs, 1, -1)
+        else:
+            # The target step's rows: scatter the flat tokens into them.
+            step = self.runner.step_shape
+            assert step is not None
+            layout = step.layout
+            token_rows = step.token_rows
+            num_flat = token_rows.shape[0]
+            rows = layout.num_reqs * layout.query_len
+            input_ids = self.input_buffers.input_ids.new_zeros(rows)
+            input_ids[token_rows] = self.input_buffers.input_ids[:num_flat]
+            input_ids = input_ids.view(layout.num_reqs, layout.query_len)
+            hidden_states = self.hidden_states.new_zeros(rows, self.hidden_size)
+            hidden_states[token_rows] = self.hidden_states[:num_flat]
+            hidden_states = hidden_states.view(layout.num_reqs, layout.query_len, -1)
+            positions = torch.from_numpy(step.positions)
         staged = self.input_stager.stage(
             input_ids=input_ids,
-            positions=torch.from_numpy(positions),
+            positions=positions,
             hidden_states=hidden_states,
-            token_indices=token_indices,
             layout=layout,
         )
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
-            num_tokens=num_tokens,
+            num_tokens=layout.num_reqs_padded * layout.query_len_padded,
             num_tokens_across_dp=num_tokens_across_dp,
-            num_padded_tokens=batch_desc.num_tokens_padded,
+            num_padded_tokens=self._num_padded_tokens,
         ):
-            return self.model_executable(
+            out = self.model_executable(
                 input_ids=staged.input_ids,
                 positions=staged.positions,
                 hidden_states=staged.hidden_states,
-                token_indices=staged.token_indices,
             )
+        last_hidden, hidden = out if isinstance(out, tuple) else (out, out)
+        if token_rows is None:
+            return last_hidden[:num_reqs], hidden[:num_reqs]
+        return last_hidden[token_rows], hidden[token_rows]
+
+    def _build_draft_attn_metadata(  # type: ignore[override]
+        self,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens_padded: int,
+        num_query_per_req: int = 1,
+        causal: bool | Any = True,
+    ) -> dict[str, Any] | None:
+        assert num_query_per_req == 1
+        positions = self.input_buffers.positions[:num_reqs].cpu()
+        seq_lens = self.input_buffers.seq_lens[:num_reqs].cpu()
+        return self.runner.rbln_attn_metadata(
+            self.attn_groups,
+            num_reqs,
+            num_reqs_padded,
+            torch.from_numpy(np.arange(num_reqs + 1, dtype=np.int32)),
+            seq_lens,
+            positions,
+            tuple(self.block_tables.input_block_tables),
+            False,
+        )

@@ -96,9 +96,9 @@ class StepShape:
     """Per request, how many already-computed tokens open its row: a decode
     window near ``max_model_len`` starts early rather than run past it."""
     block_tables: tuple[torch.Tensor, ...]
-    hidden_states: torch.Tensor | None
-    """What the draft reads instead of the target's last hidden states: eagle3's
-    aux states, combined by the drafter's projection inside the target graph."""
+    token_rows: torch.Tensor
+    """For each token in upstream's flat order, its index in the flattened
+    rows; upstream and the drafter read and write flat, the graph reads rows."""
 
 
 class RBLNModelRunnerV2(GPUModelRunner):
@@ -207,21 +207,19 @@ class RBLNModelRunnerV2(GPUModelRunner):
                 **kwargs,
             )
             if self.is_pooling_model or not self.is_last_pp_rank:
-                return model_output, None, None
-            draft_hidden_states = None
+                return model_output, None
+            # eagle3's aux states leave the graph as one concatenated tensor:
+            # a list of outputs that alias each other does not compile.
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = model_output
-                assert self.speculator is not None
-                draft_hidden_states = self.speculator.model.combine_hidden_states(
-                    torch.cat([h.view(-1, h.shape[-1]) for h in aux_hidden_states], -1)
-                )
+                aux = (torch.cat(aux_hidden_states, dim=-1),)
             else:
-                hidden_states = model_output
+                hidden_states, aux = model_output, ()
             sample_hidden_states = hidden_states
             if token_indices is not None:
                 sample_hidden_states = hidden_states[:, token_indices]
             logits = self.model.compute_logits(sample_hidden_states)
-            return hidden_states, logits.view(-1, logits.size(-1)), draft_hidden_states
+            return logits.view(-1, logits.size(-1)), hidden_states, *aux
 
         if self.model_config.enforce_eager or not self.rbln_config.compile_model:
             self.model_executable = model_wrapper
@@ -405,22 +403,21 @@ class RBLNModelRunnerV2(GPUModelRunner):
             query_len=query_len,
             query_len_padded=query_len_padded,
         )
-        self.step_shape = StepShape(
-            layout, input_ids, positions_np, front_pad, block_tables, None
+        # Flat token (req i, offset j) sits in row i at column front_pad_i + j.
+        req_of_token = np.repeat(np.arange(num_reqs), num_scheduled)
+        offset = np.arange(input_batch.num_tokens) - np.repeat(
+            input_batch.query_start_loc_np[:num_reqs], num_scheduled
         )
-        if self.is_prefill:
-            self._step_logits_index = None
-        else:
-            # Each request's logits are its last cu_num_logits tokens.
-            num_logits = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
-            rows = np.repeat(np.arange(num_reqs), num_logits)
-            offset = np.arange(int(num_logits.sum())) - np.repeat(
-                input_batch.cu_num_logits_np[:num_reqs], num_logits
-            )
-            local = (front_pad + num_scheduled - num_logits)[rows] + offset
-            self._step_logits_index = torch.from_numpy(
-                rows * query_len_padded + local
-            ).to(self.device)
+        token_rows = torch.from_numpy(
+            req_of_token * query_len_padded + front_pad[req_of_token] + offset
+        ).to(self.device)
+        self.step_shape = StepShape(
+            layout, input_ids, positions_np, front_pad, block_tables, token_rows
+        )
+        # A prefill graph gathers its logits at token_indices already.
+        self._step_logits_index = (
+            None if self.is_prefill else token_rows[input_batch.logits_indices]
+        )
         return self.rbln_attn_metadata(
             attn_groups,
             num_reqs,
@@ -548,19 +545,26 @@ class RBLNModelRunnerV2(GPUModelRunner):
             num_padded_tokens=self._num_padded_tokens,
         ):
             self.kv_connector.pre_forward(scheduler_output)
-            model_output, logits, draft_hidden_states = self.model_executable(
-                **staged.as_kwargs()
-            )
-        step.hidden_states = draft_hidden_states
-        self._step_logits = logits
+            outputs = self.model_executable(**staged.as_kwargs())
         if not self.is_last_pp_rank:
+            model_output, _ = outputs
             assert isinstance(model_output, IntermediateTensors)
             return model_output
-        hidden_states = model_output.reshape(-1, model_output.shape[-1])
+        self._step_logits, hidden_states, *aux_hidden_states = outputs
+
+        def flat(rows: torch.Tensor) -> torch.Tensor:
+            # Upstream reads num_tokens_after_padding rows in flat token order.
+            out = rows.new_zeros(batch_desc.num_tokens, rows.shape[-1])
+            out[: step.token_rows.shape[0]] = rows.reshape(-1, rows.shape[-1])[
+                step.token_rows
+            ]
+            return out
+
         if self.use_aux_hidden_state_outputs:
-            # The drafter reads the graph-combined aux states from step_shape.
-            return hidden_states, None
-        return hidden_states
+            (aux_cat,) = aux_hidden_states
+            num_aux = aux_cat.shape[-1] // hidden_states.shape[-1]
+            return flat(hidden_states), [flat(h) for h in aux_cat.chunk(num_aux, -1)]
+        return flat(hidden_states)
 
     def sample(
         self,

@@ -944,6 +944,125 @@ def _block_verification_unsupported(grid, *args, **kwargs) -> None:
     )
 
 
+def _draft_prepare_prefill_inputs(
+    grid,
+    last_token_indices,
+    draft_current_step,
+    draft_input_ids,
+    draft_positions,
+    draft_query_start_loc,
+    draft_seq_lens,
+    target_input_ids,
+    target_positions,
+    idx_mapping,
+    last_sampled,
+    next_prefill_tokens,
+    num_sampled,
+    num_rejected,
+    query_start_loc,
+    seq_lens,
+    max_num_reqs,
+    **_,
+) -> None:
+    """The draft's first-pass inputs: the target's tokens shifted one left
+    within each request, the token the target sampled last (or the next
+    prompt token) in the last kept slot, and the target's positions."""
+    num_reqs = grid[0]
+    qsl = query_start_loc[: num_reqs + 1].long()
+    starts, ends = qsl[:-1], qsl[1:]
+    query_len = ends - starts - num_rejected[:num_reqs].long()
+    req_state = idx_mapping[:num_reqs].long()
+    next_token = torch.where(
+        num_sampled[:num_reqs] > 0,
+        last_sampled[req_state].view(-1).to(draft_input_ids.dtype),
+        next_prefill_tokens[req_state].to(draft_input_ids.dtype),
+    )
+    num_tokens = int(ends[-1])
+    tok_req, off = _expand(qsl)
+    kept = off < query_len[tok_req]
+    src = torch.arange(num_tokens, device=qsl.device)
+    shifted = src[kept & (off >= 1)]
+    draft_input_ids[shifted - 1] = target_input_ids[shifted]
+    last = starts + query_len - 1
+    last_token_indices[:num_reqs] = last
+    last_token_indices[num_reqs:max_num_reqs] = 0
+    draft_input_ids[last] = next_token
+    draft_positions[src[kept]] = target_positions[src[kept]]
+    draft_query_start_loc[:num_reqs] = starts.to(draft_query_start_loc.dtype)
+    draft_query_start_loc[num_reqs : max_num_reqs + 1] = ends[-1].to(
+        draft_query_start_loc.dtype
+    )
+    draft_seq_lens[:num_reqs] = seq_lens[:num_reqs]
+    draft_seq_lens[num_reqs:max_num_reqs] = 0
+    draft_current_step.fill_(0)
+
+
+def _draft_prepare_decode_inputs(
+    grid,
+    draft_tokens,
+    _stride,
+    target_seq_lens,
+    num_rejected,
+    input_ids,
+    positions,
+    query_start_loc,
+    seq_lens,
+    max_model_len,
+    max_num_reqs,
+    ADVANCE_DRAFT_POSITIONS: bool = True,
+    **_,
+) -> None:
+    num_reqs = grid[0] - 1
+    input_ids[:num_reqs] = draft_tokens[:num_reqs].to(input_ids.dtype)
+    if ADVANCE_DRAFT_POSITIONS:
+        positions[:num_reqs] = torch.clamp(
+            positions[:num_reqs] + 1, max=max_model_len - 1
+        )
+        seq_lens[:num_reqs] = torch.clamp(
+            target_seq_lens[:num_reqs] - num_rejected[:num_reqs] + 1, max=max_model_len
+        )
+    arange = torch.arange(max_num_reqs + 1, device=query_start_loc.device)
+    query_start_loc[: max_num_reqs + 1] = torch.clamp(arange, max=num_reqs).to(
+        query_start_loc.dtype
+    )
+    seq_lens[num_reqs:max_num_reqs] = 0
+
+
+def _draft_update_inputs(
+    grid,
+    output_draft_tokens,
+    _stride1,
+    next_input_hidden_states,
+    _stride2,
+    input_ids,
+    positions,
+    seq_lens,
+    draft_tokens,
+    current_draft_step,
+    hidden_states,
+    _stride3,
+    hidden_size,
+    max_model_len,
+    num_speculative_steps,
+    ADVANCE_DRAFT_POSITIONS: bool = True,
+    **_,
+) -> None:
+    num_reqs = grid[0]
+    step = int(current_draft_step)
+    output_draft_tokens[:num_reqs, step] = draft_tokens[:num_reqs]
+    if step >= num_speculative_steps - 1:
+        return
+    input_ids[:num_reqs] = draft_tokens[:num_reqs].to(input_ids.dtype)
+    next_input_hidden_states[:num_reqs, :hidden_size] = hidden_states[
+        :num_reqs, :hidden_size
+    ]
+    if ADVANCE_DRAFT_POSITIONS:
+        positions[:num_reqs] = torch.clamp(
+            positions[:num_reqs] + 1, max=max_model_len - 1
+        )
+        seq_lens[:num_reqs] = torch.clamp(seq_lens[:num_reqs] + 1, max=max_model_len)
+
+
 _KERNELS_BY_MODULE: dict[str, dict[str, Callable[..., Any]]] = {
     "input_batch": {
         "_prepare_prefill_inputs_kernel": _prepare_prefill_inputs,
@@ -990,6 +1109,11 @@ _KERNELS_BY_MODULE: dict[str, dict[str, Callable[..., Any]]] = {
     },
     "buffer_utils": {
         "_apply_write_kernel": _apply_write,
+    },
+    "spec_decode.autoregressive.speculator": {
+        "_prepare_prefill_inputs_kernel": _draft_prepare_prefill_inputs,
+        "_prepare_decode_inputs_kernel": _draft_prepare_decode_inputs,
+        "_update_draft_inputs_kernel": _draft_update_inputs,
     },
     "spec_decode.rejection_sampler_utils": {
         "_compute_local_logits_stats_kernel": _compute_local_logits_stats,

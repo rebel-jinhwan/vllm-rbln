@@ -511,3 +511,93 @@ def test_flatten_sampled_places_each_request_at_its_logit_offset():
         flat, sampled, sampled.stride(0), num_sampled, cu_num_logits, num_warps=1
     )
     assert flat.tolist() == [10, 11, 0, 20, 0, 0]
+
+
+def test_draft_prefill_inputs_shift_tokens_and_place_next_token():
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as sp
+
+    # req 0: 4 target tokens, 1 rejected -> draft consumes 3; req 1: 2 tokens.
+    buffers = InputBuffers(max_num_reqs=MAX_REQS, max_num_tokens=16, device="cpu")
+    target_ids = _i32([10, 11, 12, 13, 20, 21])
+    target_pos = _i64([5, 6, 7, 8, 0, 1])
+    last_token_indices = torch.zeros(MAX_REQS, dtype=torch.int64)
+    step = torch.tensor(7)
+    sp._prepare_prefill_inputs_kernel[(2,)](
+        last_token_indices,
+        step,
+        buffers.input_ids,
+        buffers.positions,
+        buffers.query_start_loc,
+        buffers.seq_lens,
+        target_ids,
+        target_pos,
+        _i32([3, 1]),  # idx_mapping
+        _i64([[0], [0], [0], [99], [0], [0], [0], [0]]),  # last_sampled per state
+        _i32([0, 55, 0, 0, 0, 0, 0, 0]),  # next_prefill_tokens per state
+        _i32([1, 0]),  # req 0 sampled, req 1 still prefilling
+        _i32([1, 0]),  # num_rejected
+        _i32([0, 4, 6]),  # query_start_loc
+        _i32([9, 2]),  # seq_lens
+        MAX_REQS,
+        BLOCK_SIZE=1024,
+    )
+    assert buffers.input_ids[:6].tolist() == [11, 12, 99, 0, 21, 55]
+    assert last_token_indices[:2].tolist() == [2, 5]
+    assert buffers.positions[:6].tolist() == [5, 6, 7, 0, 0, 1]
+    assert buffers.query_start_loc[: MAX_REQS + 1].tolist() == [0, 4] + [6] * 7
+    assert buffers.seq_lens[:3].tolist() == [9, 2, 0]
+    assert step.item() == 0
+
+
+def test_draft_decode_and_update_inputs_advance_positions():
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as sp
+
+    buffers = InputBuffers(max_num_reqs=MAX_REQS, max_num_tokens=16, device="cpu")
+    buffers.positions[:2] = _i64([7, 30])
+    draft_tokens = _i64([[3, 0], [4, 0]])
+    sp._prepare_decode_inputs_kernel[(3,)](
+        draft_tokens[:, 0],
+        draft_tokens.stride(0),
+        _i32([9, 31]),  # target seq_lens
+        _i32([1, 0]),  # num_rejected
+        buffers.input_ids,
+        buffers.positions,
+        buffers.query_start_loc,
+        buffers.seq_lens,
+        32,  # max_model_len
+        MAX_REQS,
+        BLOCK_SIZE=1024,
+        ADVANCE_DRAFT_POSITIONS=True,
+    )
+    assert buffers.input_ids[:2].tolist() == [3, 4]
+    assert buffers.positions[:2].tolist() == [8, 31]  # clamped to max_model_len - 1
+    assert buffers.seq_lens[:3].tolist() == [9, 32, 0]
+    assert buffers.query_start_loc[:4].tolist() == [0, 1, 2, 2]
+
+    hidden = torch.arange(2 * 4, dtype=torch.float32).view(2, 4)
+    next_hidden = torch.zeros(MAX_REQS, 4)
+    step = torch.tensor(0)
+    sp._update_draft_inputs_kernel[(2,)](
+        draft_tokens,
+        draft_tokens.stride(0),
+        next_hidden,
+        next_hidden.stride(0),
+        buffers.input_ids,
+        buffers.positions,
+        buffers.seq_lens,
+        _i64([5, 6]),  # this step's draft tokens
+        step,
+        hidden,
+        hidden.stride(0),
+        4,
+        32,
+        2,
+        BLOCK_SIZE=1024,
+        ADVANCE_DRAFT_POSITIONS=True,
+    )
+    assert draft_tokens[:, 0].tolist() == [5, 6]
+    assert buffers.input_ids[:2].tolist() == [5, 6]
+    assert torch.equal(next_hidden[:2], hidden)
+    assert buffers.positions[:2].tolist() == [9, 31]
