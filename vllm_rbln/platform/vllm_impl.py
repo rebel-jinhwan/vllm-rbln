@@ -15,7 +15,8 @@
 """The vllm model path's half of the platform hooks."""
 
 import os
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
@@ -35,6 +36,15 @@ logger = init_logger(__name__)
 
 def patch_upstream() -> None:
     """The vllm model path replaces no upstream symbol from the platform hook."""
+
+
+HAS_V2_MODEL_RUNNER_KERNELS = True
+
+
+def get_kernel_impl(kernel: str) -> Callable[..., Any] | None:
+    from vllm_rbln.v1.worker.v2_kernels import KERNELS
+
+    return KERNELS.get(kernel)
 
 
 def add_cli_args(parser: "FlexibleArgumentParser") -> None:

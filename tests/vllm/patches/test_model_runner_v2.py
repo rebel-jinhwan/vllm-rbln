@@ -19,6 +19,7 @@ of each kernel."""
 import numpy as np
 import pytest
 import torch
+from vllm.triton_utils.importing import PlaceholderKernel
 from vllm.v1.worker.gpu import input_batch as ib
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import apply_bad_words
@@ -29,8 +30,6 @@ from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 from vllm.v1.worker.gpu.sample.penalties import apply_penalties, bincount
 from vllm.v1.worker.gpu.sample.prompt_logprob import get_prompt_logprobs_token_ids
 from vllm.v1.worker.gpu.structured_outputs import _apply_grammar_bitmask_kernel
-
-from vllm_rbln.patches.model_runner_v2 import _TorchKernel
 
 MAX_REQS = 8
 MAX_LEN = 32
@@ -45,9 +44,12 @@ def _i64(x):
     return torch.tensor(x, dtype=torch.int64)
 
 
-def test_kernels_are_torch_stand_ins():
-    assert isinstance(ib._prepare_prefill_inputs_kernel, _TorchKernel)
-    assert isinstance(_apply_grammar_bitmask_kernel, _TorchKernel)
+def test_kernels_resolve_to_torch_implementations():
+    from vllm.platforms import current_platform
+
+    for kernel in (ib._prepare_prefill_inputs_kernel, _apply_grammar_bitmask_kernel):
+        assert isinstance(kernel, PlaceholderKernel)
+        assert current_platform.get_kernel_impl(kernel.qualname) is not None
 
 
 def test_prepare_prefill_inputs_copies_prompt_chunks_and_next_token():
@@ -408,17 +410,25 @@ def test_staged_write_tensor_flushes_rows():
 
 
 def _rejection_inputs(num_reqs, cu, temps, seeds=None):
-    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
-
-    del RejectionSampler  # imported for its module-level patch target only
     cu_num_logits = _i32(cu)
     num_logits = cu[-1]
     idx_mapping = _i32(list(range(num_reqs)))
+    lens = [cu[r + 1] - cu[r] for r in range(num_reqs)]
+    expanded_idx_mapping = _i32([r for r, n in enumerate(lens) for _ in range(n)])
+    expanded_local_pos = _i32([i for n in lens for i in range(n)])
     temperature = torch.zeros(MAX_REQS)
     temperature[:num_reqs] = torch.tensor(temps)
     seed = _i64(seeds or [0] * MAX_REQS)
     pos = _i32(list(range(num_logits)))
-    return cu_num_logits, idx_mapping, temperature, seed, pos
+    return (
+        cu_num_logits,
+        idx_mapping,
+        expanded_idx_mapping,
+        expanded_local_pos,
+        temperature,
+        seed,
+        pos,
+    )
 
 
 def test_rejection_sample_greedy_accepts_matching_prefix():
@@ -432,8 +442,8 @@ def test_rejection_sample_greedy_accepts_matching_prefix():
     for row, tok in enumerate([3, 9, 5, 1, 4, 2]):
         logits[row, tok] = 0.0
     draft_sampled = _i32([-1, 3, 7, -1, 1, -1])
-    cu_num_logits, idx_mapping, temperature, seed, pos = _rejection_inputs(
-        3, cu, [0.0, 0.0, 0.0]
+    cu_num_logits, idx_mapping, expanded_idx, expanded_pos, temperature, seed, pos = (
+        _rejection_inputs(3, cu, [0.0, 0.0, 0.0])
     )
     sampled, num_sampled = rs.rejection_sample(
         logits,
@@ -442,8 +452,8 @@ def test_rejection_sample_greedy_accepts_matching_prefix():
         cu_num_logits,
         pos,
         idx_mapping,
-        idx_mapping,
-        torch.zeros(6, dtype=torch.int32),
+        expanded_idx,
+        expanded_pos,
         temperature,
         seed,
         num_speculative_steps=2,
@@ -464,9 +474,15 @@ def test_rejection_sample_random_never_resamples_rejected_draft():
     logits[0, 7] = float("-inf")
     draft_sampled = _i32([-1, 7])
     for s in range(5):
-        cu_num_logits, idx_mapping, temperature, seed, pos = _rejection_inputs(
-            1, cu, [1.0], seeds=[s] * MAX_REQS
-        )
+        (
+            cu_num_logits,
+            idx_mapping,
+            expanded_idx,
+            expanded_pos,
+            temperature,
+            seed,
+            pos,
+        ) = _rejection_inputs(1, cu, [1.0], seeds=[s] * MAX_REQS)
         sampled, num_sampled = rs.rejection_sample(
             logits,
             None,
@@ -474,8 +490,8 @@ def test_rejection_sample_random_never_resamples_rejected_draft():
             cu_num_logits,
             pos,
             idx_mapping,
-            idx_mapping,
-            torch.zeros(2, dtype=torch.int32),
+            expanded_idx,
+            expanded_pos,
             temperature,
             seed,
             num_speculative_steps=1,

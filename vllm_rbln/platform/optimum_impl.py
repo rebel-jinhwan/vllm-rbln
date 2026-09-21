@@ -27,6 +27,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+HAS_V2_MODEL_RUNNER_KERNELS = False
+
+
 def patch_upstream() -> None:
     # Only sync_from_vllm reads the key the first one writes, and on the vllm
     # path it would be an unknown field of RBLNConfig.

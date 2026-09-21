@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -321,6 +322,20 @@ class RblnPlatform(Platform):
         if not USE_DEVICE_TENSOR:
             return 0.0
         return float(torch.rbln.memory_allocated(device))
+
+    def supports_uva(self) -> bool:
+        return False
+
+    @classmethod
+    def has_v2_model_runner_kernels(cls) -> bool:
+        return _impl().HAS_V2_MODEL_RUNNER_KERNELS
+
+    @classmethod
+    def get_kernel_impl(cls, kernel: str) -> Callable[..., Any] | None:
+        impl = _impl()
+        if not impl.HAS_V2_MODEL_RUNNER_KERNELS:
+            return None
+        return impl.get_kernel_impl(kernel)
 
     @classmethod
     def is_pin_memory_available(cls):

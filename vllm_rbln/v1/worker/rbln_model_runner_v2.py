@@ -22,8 +22,7 @@ taken from the scheduler output, the RBLN attention metadata builder, and
 logits computed inside the graph.
 """
 
-import functools
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -83,23 +82,6 @@ from vllm_rbln.v1.worker.utils import num_attn_module as rbln_num_attn_module
 logger = init_logger(__name__)
 
 
-@contextmanager
-def _without_cuda_streams():
-    """``GPUModelRunner.__init__`` constructs CUDA streams and events for its
-    copy paths; this torch build has none. The V2 runner never uses them."""
-
-    class _Placeholder:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
-    saved = torch.cuda.Stream, torch.cuda.Event
-    torch.cuda.Stream = torch.cuda.Event = _Placeholder  # type: ignore[misc, assignment]
-    try:
-        yield
-    finally:
-        torch.cuda.Stream, torch.cuda.Event = saved  # type: ignore[misc]
-
-
 @dataclass
 class StepShape:
     """The rows a step staged for the target, kept for the draft that follows:
@@ -140,9 +122,7 @@ class RBLNModelRunnerV2(GPUModelRunner):
                 + " yet; unset VLLM_USE_V2_MODEL_RUNNER."
             )
 
-        with _without_cuda_streams():
-            super().__init__(vllm_config, device)
-        self.output_copy_stream = None
+        super().__init__(vllm_config, device)
         if vllm_config.speculative_config is not None and self.is_last_pp_rank:
             self.speculator = RBLNEagleSpeculator(vllm_config, device, self)
 
@@ -197,10 +177,6 @@ class RBLNModelRunnerV2(GPUModelRunner):
         self.intermediate_tensors_dict: dict[tuple[int, int], IntermediateTensors] = {}
         # What this step's DP ranks reported; None on a single rank.
         self.dp_status: DPStatus | None = None
-
-    @functools.cached_property
-    def main_stream(self) -> None:  # type: ignore[override]
-        return None
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         with self.offload_context():
