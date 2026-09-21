@@ -165,10 +165,9 @@ class TestPlatformIdentity:
 
 
 class TestRejectedConfigs:
-    def test_v2_model_runner(self, monkeypatch, reconfigure):
+    def test_v2_model_runner_is_accepted(self, monkeypatch, reconfigure):
         monkeypatch.setattr(platform.envs, "VLLM_USE_V2_MODEL_RUNNER", True)
-        with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER"):
-            reconfigure(lambda config: None)
+        reconfigure(lambda config: None)
 
     def test_lora(self, reconfigure):
         with pytest.raises(ValueError, match="LoRA"):

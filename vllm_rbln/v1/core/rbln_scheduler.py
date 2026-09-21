@@ -944,12 +944,24 @@ class RBLNScheduler(Scheduler):
         )
 
         # Construct the scheduler output.
-        new_reqs_data = [
-            NewRequestData.from_request(
-                req, req_to_new_blocks[req.request_id].get_block_ids()
-            )
-            for req in scheduled_new_reqs
-        ]
+        if self.use_v2_model_runner:
+            scheduled_new_reqs.extend(scheduled_resumed_reqs)
+            scheduled_resumed_reqs.clear()
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    req._all_token_ids,
+                )
+                for req in scheduled_new_reqs
+            ]
+        else:
+            new_reqs_data = [
+                NewRequestData.from_request(
+                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                )
+                for req in scheduled_new_reqs
+            ]
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(

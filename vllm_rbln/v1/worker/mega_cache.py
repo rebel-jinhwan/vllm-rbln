@@ -104,6 +104,9 @@ def _warmup_graph_set_factors(vllm_config) -> str:
         "draft_tensor_parallel_size": normalize_value(
             getattr(spec, "draft_tensor_parallel_size", None)
         ),
+        "v2_model_runner": normalize_value(
+            getattr(vllm_config, "use_v2_model_runner", False)
+        ),
     }
     return hash_factors(factors)
 

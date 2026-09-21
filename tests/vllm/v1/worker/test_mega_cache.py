@@ -87,6 +87,12 @@ class TestSignatureComposition:
         monkeypatch.setattr(mega_cache, "_rebel_major_minor", lambda: "0.12")
         assert mega_cache.config_signature(_stub_config()) != before
 
+    def test_v2_model_runner_invalidates(self):
+        before = mega_cache.config_signature(_stub_config())
+        v2 = _stub_config()
+        v2.use_v2_model_runner = True
+        assert mega_cache.config_signature(v2) != before
+
 
 # Variables the built graph depends on and RBLNConfig does not carry, so this
 # is the only route into the key. One per type still on this route, since what

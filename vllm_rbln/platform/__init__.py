@@ -249,11 +249,6 @@ class RblnPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        if envs.VLLM_USE_V2_MODEL_RUNNER:
-            raise ValueError(
-                "VLLM_USE_V2_MODEL_RUNNER is not supported for RBLN backend."
-            )
-
         # NOTE(RBLN): checked here, not inside the selected path module -- the
         # optimum path is exactly where an unsupported flag would go unnoticed.
         if envs.VLLM_RBLN_USE_DYNAMIC_KV_CACHE:
@@ -318,6 +313,21 @@ class RblnPlatform(Platform):
             RBLNSlidingWindowManager,
             uniform_type_base_spec=RBLNSlidingWindowSpec,
         )
+
+    @classmethod
+    def get_current_memory_usage(
+        cls, device: torch.types.Device | None = None
+    ) -> float:
+        if not USE_DEVICE_TENSOR:
+            return 0.0
+        return float(torch.rbln.memory_allocated(device))
+
+    def supports_uva(self) -> bool:
+        return False
+
+    @classmethod
+    def has_v2_model_runner_kernels(cls) -> bool:
+        return _impl().HAS_V2_MODEL_RUNNER_KERNELS
 
     @classmethod
     def is_pin_memory_available(cls):

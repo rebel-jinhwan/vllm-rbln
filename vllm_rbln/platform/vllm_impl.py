@@ -37,6 +37,9 @@ def patch_upstream() -> None:
     """The vllm model path replaces no upstream symbol from the platform hook."""
 
 
+HAS_V2_MODEL_RUNNER_KERNELS = True
+
+
 def add_cli_args(parser: "FlexibleArgumentParser") -> None:
     from vllm_rbln.config import add_rbln_cli_args
 
