@@ -265,7 +265,7 @@ class RBLNEagleSpeculator(EagleSpeculator):
             layout.num_reqs, num_tokens, is_prefill, first_pass=first_pass
         )
         positions = positions.astype(np.int64)
-        attn_metadata = self.runner.build_attn_metadata(
+        attn_metadata = self.runner.rbln_attn_metadata(
             self.attn_groups,
             layout.num_reqs,
             layout.num_reqs_padded,

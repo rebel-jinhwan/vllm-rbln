@@ -16,10 +16,12 @@
 
 Upstream owns request state, block tables, input preparation and sampling
 (``vllm/v1/worker/gpu/``, with its triton kernels swapped for torch by
-``vllm_rbln.patches.model_runner_v2``). This class adds what RBLN cannot
-express there: one compiled graph per padded shape, the prefill/decode phase
-taken from the scheduler output, the RBLN attention metadata builder, and
-logits computed inside the graph.
+``vllm_rbln.patches.model_runner_v2``). This class overrides upstream's
+three hardware seams: `dispatch_batch` picks the compiled shape, with the
+prefill/decode phase taken from the scheduler output; `build_attn_metadata`
+calls the RBLN builder and lays the step out as padded rows; `run_model`
+stages those rows into the compiled graph, which returns the logits with the
+hidden states.
 """
 
 from contextlib import nullcontext
@@ -30,13 +32,13 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu.attn_utils import (
-    build_slot_mappings_by_layer,
     get_shared_kv_cache_layers,
 )
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -73,9 +75,7 @@ from vllm_rbln.v1.worker.dp_utils import (
 from vllm_rbln.v1.worker.input_stager import InputLayout, InputStager
 from vllm_rbln.v1.worker.utils import (
     get_kv_cache_names,
-    get_or_create_intermediate_tensors,
     make_weights_contiguous,
-    recv_intermediate_tensors,
 )
 from vllm_rbln.v1.worker.utils import num_attn_module as rbln_num_attn_module
 
@@ -123,8 +123,7 @@ class RBLNModelRunnerV2(GPUModelRunner):
             )
 
         super().__init__(vllm_config, device)
-        if vllm_config.speculative_config is not None and self.is_last_pp_rank:
-            self.speculator = RBLNEagleSpeculator(vllm_config, device, self)
+        self.execute_model_state: ExecuteModelState | None = None
 
         # Step phase, stamped from the scheduler output before anything reads it.
         self.is_prefill: bool = False
@@ -148,7 +147,7 @@ class RBLNModelRunnerV2(GPUModelRunner):
         )
         self.specialized_moe_decode = False
         # Read by the worker's runtime count: with a drafter every decode row
-        # is decode_query_len wide (see execute_model), so one decode graph.
+        # is decode_query_len wide (see dispatch_batch), so one decode graph.
         self.uses_fixed_decode_window = True
         self.shape_config: ShapeConfig = ShapeConfig(
             decode_batch_buckets=self.bucketing_manager.decode_batch_buckets,
@@ -173,10 +172,17 @@ class RBLNModelRunnerV2(GPUModelRunner):
         # staged layout; None on a prefill, whose graph gathered them already.
         self._step_logits_index: torch.Tensor | None = None
         self.step_shape: StepShape | None = None
-        # PP hand-off buffers per staged shape; see recv_intermediate_tensors.
-        self.intermediate_tensors_dict: dict[tuple[int, int], IntermediateTensors] = {}
         # What this step's DP ranks reported; None on a single rank.
         self.dp_status: DPStatus | None = None
+        # Set by _dummy_run for the step a rank without work joins; the
+        # dispatch tells the group so instead of driving the shape.
+        self._dp_idle = False
+        # The token dimension the DP group settled on this step, for the
+        # forward context; None on a single rank.
+        self._num_padded_tokens: int | None = None
+
+    def init_speculator(self) -> RBLNEagleSpeculator:
+        return RBLNEagleSpeculator(self.vllm_config, self.device, self)
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         with self.offload_context():
@@ -258,11 +264,13 @@ class RBLNModelRunnerV2(GPUModelRunner):
         self.cache_config.num_cpu_blocks = 0
 
     def recv_intermediate_tensors(self) -> IntermediateTensors:
-        return recv_intermediate_tensors(
-            self.intermediate_tensors_dict,
-            self.model,
-            self.model_config.dtype,
-            self.device,
+        # The previous stage sends its graph output as padded rows; upstream's
+        # execute_model copies flat token-major slices, and run_model views
+        # them back as rows.
+        received = get_pp_group().recv_tensor_dict()
+        assert isinstance(received, dict)
+        return IntermediateTensors(
+            {name: t.view(-1, t.shape[-1]) for name, t in received.items()}
         )
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -286,13 +294,25 @@ class RBLNModelRunnerV2(GPUModelRunner):
                 srcs.append(src[..., : op.num_tokens, :])
         torch._foreach_copy_(dsts, srcs)
 
-    def _batch_descriptor(
-        self, num_reqs: int, num_tokens: int, is_idle: bool = False
-    ) -> tuple[BatchExecutionDescriptor | None, torch.Tensor | None, int | None]:
-        """This step's padded batch, agreed with the other DP ranks when there
-        are any (see v1/worker/dp_utils.py); None when the whole group is idle.
-        Also returns what RBLN's forward context needs under DP: the per-rank
-        token counts and the token dimension the group settled on."""
+    def dispatch_batch(  # type: ignore[override]
+        self,
+        scheduler_output: SchedulerOutput,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        max_query_len: int,
+        *,
+        dummy_run: bool,
+        need_eager: bool,
+        num_active_loras: int,
+        **kwargs: Any,
+    ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
+        """The compiled shape this step runs, agreed with the other DP ranks
+        when there are any (see v1/worker/dp_utils.py). With a drafter every
+        decode row is decode_query_len wide, whatever each request brought,
+        so one decode graph serves every step."""
+        if self.speculative_config is not None and not self.is_prefill:
+            num_tokens = num_reqs * self.decode_query_len
         dp_size = self.parallel_config.data_parallel_size
         num_tokens_across_dp: torch.Tensor | None = None
         if dp_size == 1:
@@ -311,12 +331,14 @@ class RBLNModelRunnerV2(GPUModelRunner):
                 num_reqs=num_reqs,
                 num_tokens=num_tokens,
                 is_prefill=self.is_prefill,
-                is_idle=is_idle,
+                is_idle=self._dp_idle,
             )
             self.dp_status = dp_status
             num_tokens_across_dp = dp_status.num_tokens_across_dp
         if batch_desc is None:
-            return None, None, None
+            # Every DP rank is idle: they all read the same status and stop here.
+            return BatchExecutionDescriptor(CUDAGraphMode.NONE, 0, 0), None
+        self._num_padded_tokens = batch_desc.num_tokens_padded
         query_len_padded = (
             self.max_num_tokens if self.is_prefill else batch_desc.query_len
         )
@@ -328,10 +350,89 @@ class RBLNModelRunnerV2(GPUModelRunner):
                 uniform_token_count=batch_desc.query_len,
             ),
             num_tokens_across_dp,
-            batch_desc.num_tokens_padded,
         )
 
-    def build_attn_metadata(
+    def build_attn_metadata(  # type: ignore[override]
+        self,
+        input_batch: InputBatch,
+        batch_desc: BatchExecutionDescriptor,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[Any]],
+        *,
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
+        """Lay the step out as padded rows and build the RBLN metadata on them.
+        The rows are kept in step_shape for run_model and the drafter."""
+        assert batch_desc.num_reqs is not None
+        assert batch_desc.uniform_token_count is not None
+        num_reqs = input_batch.num_reqs
+        query_len = batch_desc.uniform_token_count
+        query_len_padded = batch_desc.num_tokens // batch_desc.num_reqs
+        num_computed = input_batch.num_computed_tokens_np[:num_reqs]
+        num_scheduled = input_batch.num_scheduled_tokens[:num_reqs]
+        cols = np.arange(query_len)
+        front_pad = np.zeros(num_reqs, dtype=np.int32)
+        fixed_window = self.speculative_config is not None and not self.is_prefill
+        if not fixed_window:
+            input_ids = input_batch.input_ids[: input_batch.num_tokens].view(
+                num_reqs, query_len
+            )
+        else:
+            front_pad = np.maximum(
+                0, num_computed + query_len - self.max_model_len
+            ).astype(np.int32)
+            # Row column -> this request's scheduled token, the last one
+            # repeated past the end and the already-computed ones before it.
+            local = cols[None, :] - front_pad[:, None]
+            src = input_batch.query_start_loc_np[:num_reqs, None] + np.clip(
+                local, 0, num_scheduled[:, None] - 1
+            )
+            input_ids = input_batch.input_ids[torch.from_numpy(src).to(self.device)]
+        positions_np = (num_computed - front_pad)[:, None] + cols[None, :]
+        if front_pad.any():
+            before_window = self.req_states.all_token_ids.gpu[
+                input_batch.idx_mapping.long()[:, None],
+                torch.from_numpy(positions_np).to(self.device),
+            ]
+            input_ids = torch.where(
+                torch.from_numpy(local >= 0).to(self.device), input_ids, before_window
+            )
+        positions_np = positions_np.astype(np.int64)
+        layout = InputLayout(
+            num_reqs=num_reqs,
+            num_reqs_padded=batch_desc.num_reqs,
+            query_len=query_len,
+            query_len_padded=query_len_padded,
+        )
+        self.step_shape = StepShape(
+            layout, input_ids, positions_np, front_pad, block_tables, None
+        )
+        if self.is_prefill:
+            self._step_logits_index = None
+        else:
+            # Each request's logits are its last cu_num_logits tokens.
+            num_logits = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
+            rows = np.repeat(np.arange(num_reqs), num_logits)
+            offset = np.arange(int(num_logits.sum())) - np.repeat(
+                input_batch.cu_num_logits_np[:num_reqs], num_logits
+            )
+            local = (front_pad + num_scheduled - num_logits)[rows] + offset
+            self._step_logits_index = torch.from_numpy(
+                rows * query_len_padded + local
+            ).to(self.device)
+        return self.rbln_attn_metadata(
+            attn_groups,
+            num_reqs,
+            batch_desc.num_reqs,
+            torch.from_numpy(np.arange(num_reqs + 1, dtype=np.int32) * query_len),
+            input_batch.seq_lens_cpu_upper_bound[:num_reqs],
+            torch.from_numpy(positions_np.reshape(-1)),
+            block_tables,
+            self.is_prefill,
+        )
+
+    def rbln_attn_metadata(
         self,
         attn_groups: list[list[Any]],
         num_reqs: int,
@@ -378,125 +479,57 @@ class RBLNModelRunnerV2(GPUModelRunner):
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
         dummy_run: bool = False,
-        is_idle: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        # Mirrors GPUModelRunner.execute_model up to the model call, which RBLN
-        # routes to the compiled per-shape graph with fused logits; upstream
-        # has no override point between set_forward_context and self.model().
         if not dummy_run:
             self.is_prefill = step_is_prefill(scheduler_output)
-            self.update_pp_decode_requests()
-            self.finish_requests(scheduler_output)
-            self.free_states(scheduler_output)
-            self.add_requests(scheduler_output)
-            self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
-            if scheduler_output.total_num_scheduled_tokens == 0:
-                return self.kv_connector.no_forward(scheduler_output)
+        output = super().execute_model(
+            scheduler_output,
+            intermediate_tensors,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            is_profile=is_profile,
+        )
+        if (
+            self.is_pooling_model
+            and self.is_last_pp_rank
+            and not dummy_run
+            and self.execute_model_state is not None
+        ):
+            # Upstream's worker calls pool() itself; RBLN's worker takes the
+            # step's output from execute_model.
+            return self.pool()
+        return output
 
-        num_reqs = len(scheduler_output.num_scheduled_tokens)
-        num_tokens = scheduler_output.total_num_scheduled_tokens
-        # With a drafter every decode row is decode_query_len wide, whatever
-        # each request brought, so one decode graph serves every step.
-        fixed_window = self.speculative_config is not None and not self.is_prefill
-        batch_desc, num_tokens_across_dp, num_padded_tokens = self._batch_descriptor(
-            num_reqs,
-            num_reqs * self.decode_query_len if fixed_window else num_tokens,
-            is_idle,
-        )
-        if batch_desc is None:
-            # Every DP rank is idle: they all read the same status and stop here.
-            return None
-        assert batch_desc.num_reqs is not None
-        assert batch_desc.uniform_token_count is not None
-
-        if not dummy_run:
-            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
-        else:
-            input_batch = InputBatch.make_dummy(
-                num_reqs, num_tokens, self.input_buffers
+    def run_model(  # type: ignore[override]
+        self,
+        batch_desc: BatchExecutionDescriptor,
+        input_batch: InputBatch,
+        model_inputs: dict[str, Any],
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings_by_layer: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        skip_compiled: bool,
+        scheduler_output: SchedulerOutput,
+    ) -> Any:
+        """Stage the rows build_attn_metadata laid out into the compiled graph
+        for this shape. The graph returns the logits with the hidden states;
+        sample() reads them from _step_logits."""
+        step = self.step_shape
+        assert step is not None
+        layout = step.layout
+        intermediate_tensors = model_inputs["intermediate_tensors"]
+        if intermediate_tensors is not None:
+            intermediate_tensors = IntermediateTensors(
+                {
+                    name: t.view(layout.num_reqs_padded, layout.query_len_padded, -1)
+                    for name, t in intermediate_tensors.tensors.items()
+                }
             )
-            block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
-        slot_mappings_by_layer = build_slot_mappings_by_layer(
-            slot_mappings, self.kv_cache_config
-        )
-
-        query_len = batch_desc.uniform_token_count
-        query_len_padded = batch_desc.num_tokens // batch_desc.num_reqs
-        num_computed = input_batch.num_computed_tokens_np[:num_reqs]
-        num_scheduled = input_batch.num_scheduled_tokens[:num_reqs]
-        cols = np.arange(query_len)
-        front_pad = np.zeros(num_reqs, dtype=np.int32)
-        if not fixed_window:
-            input_ids = input_batch.input_ids[:num_tokens].view(num_reqs, query_len)
-        else:
-            front_pad = np.maximum(
-                0, num_computed + query_len - self.max_model_len
-            ).astype(np.int32)
-            # Row column -> this request's scheduled token, the last one
-            # repeated past the end and the already-computed ones before it.
-            local = cols[None, :] - front_pad[:, None]
-            src = input_batch.query_start_loc_np[:num_reqs, None] + np.clip(
-                local, 0, num_scheduled[:, None] - 1
-            )
-            input_ids = input_batch.input_ids[torch.from_numpy(src).to(self.device)]
-        positions_np = (num_computed - front_pad)[:, None] + cols[None, :]
-        if front_pad.any():
-            before_window = self.req_states.all_token_ids.gpu[
-                input_batch.idx_mapping.long()[:, None],
-                torch.from_numpy(positions_np).to(self.device),
-            ]
-            input_ids = torch.where(
-                torch.from_numpy(local >= 0).to(self.device), input_ids, before_window
-            )
-        positions_np = positions_np.astype(np.int64)
-        attn_metadata = self.build_attn_metadata(
-            self.attn_groups,
-            num_reqs,
-            batch_desc.num_reqs,
-            torch.from_numpy(np.arange(num_reqs + 1, dtype=np.int32) * query_len),
-            input_batch.seq_lens_cpu_upper_bound[:num_reqs],
-            torch.from_numpy(positions_np.reshape(-1)),
-            block_tables,
-            self.is_prefill,
-        )
-        if not self.is_first_pp_rank and (dummy_run or is_idle):
-            # A previous stage's output arrives already padded; a dummy step has
-            # to build its stand-in at the same padded shape.
-            intermediate_tensors = get_or_create_intermediate_tensors(
-                self.intermediate_tensors_dict,
-                self.model,
-                batch_desc.num_reqs,
-                query_len_padded,
-                self.model_config.dtype,
-                self.device,
-            )
-        layout = InputLayout(
-            num_reqs=num_reqs,
-            num_reqs_padded=batch_desc.num_reqs,
-            query_len=query_len,
-            query_len_padded=query_len_padded,
-        )
-        self.step_shape = StepShape(
-            layout, input_ids, positions_np, front_pad, block_tables, None
-        )
-        if self.is_prefill:
-            self._step_logits_index = None
-        else:
-            # Each request's logits are its last cu_num_logits tokens.
-            num_logits = np.diff(input_batch.cu_num_logits_np[: num_reqs + 1])
-            rows = np.repeat(np.arange(num_reqs), num_logits)
-            offset = np.arange(int(num_logits.sum())) - np.repeat(
-                input_batch.cu_num_logits_np[:num_reqs], num_logits
-            )
-            local = (front_pad + num_scheduled - num_logits)[rows] + offset
-            self._step_logits_index = torch.from_numpy(
-                rows * query_len_padded + local
-            ).to(self.device)
         staged = self.input_stager.stage(
-            input_ids=input_ids,
-            positions=torch.from_numpy(positions_np),
+            input_ids=step.input_ids,
+            positions=torch.from_numpy(step.positions),
             intermediate_tensors=intermediate_tensors,
             token_indices=(
                 input_batch.logits_indices.to(torch.int32)
@@ -512,32 +545,22 @@ class RBLNModelRunnerV2(GPUModelRunner):
             self.vllm_config,
             num_tokens=batch_desc.num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
-            num_padded_tokens=num_padded_tokens,
+            num_padded_tokens=self._num_padded_tokens,
         ):
+            self.kv_connector.pre_forward(scheduler_output)
             model_output, logits, draft_hidden_states = self.model_executable(
                 **staged.as_kwargs()
             )
-        self.step_shape.hidden_states = draft_hidden_states
-
-        if self.is_last_pp_rank:
-            hidden_states = model_output.reshape(-1, model_output.shape[-1])
-        else:
-            assert isinstance(model_output, IntermediateTensors)
-            hidden_states = None
+        step.hidden_states = draft_hidden_states
         self._step_logits = logits
-        self.execute_model_state = ExecuteModelState(
-            input_batch=input_batch,
-            attn_metadata=attn_metadata,
-            slot_mappings_by_layer=slot_mappings_by_layer,
-            hidden_states=hidden_states,
-            aux_hidden_states=None,
-            finished_req_ids=scheduler_output.finished_req_ids,
-        )
         if not self.is_last_pp_rank:
+            assert isinstance(model_output, IntermediateTensors)
             return model_output
-        if self.is_pooling_model and not dummy_run:
-            return self.pool()
-        return None
+        hidden_states = model_output.reshape(-1, model_output.shape[-1])
+        if self.use_aux_hidden_state_outputs:
+            # The drafter reads the graph-combined aux states from step_shape.
+            return hidden_states, None
+        return hidden_states
 
     def sample(
         self,
@@ -588,7 +611,11 @@ class RBLNModelRunnerV2(GPUModelRunner):
             f"_dummy_req_{i}": num_tokens_per_req for i in range(num_reqs)
         }
         self.kv_connector.set_disabled(True)
-        self.execute_model(scheduler_output, dummy_run=True, is_idle=not warmup)
+        self._dp_idle = not warmup
+        # Upstream's execute_model only checks that a non-first stage has a
+        # hand-off to slice on a dummy step; it reads its own buffer.
+        self.execute_model(scheduler_output, self.intermediate_tensors, dummy_run=True)
+        self._dp_idle = False
         self.kv_connector.set_disabled(False)
         state = self.execute_model_state
         if self.speculator is not None and state is not None:
