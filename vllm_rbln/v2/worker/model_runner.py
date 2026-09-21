@@ -32,7 +32,6 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.parallel_state import get_pp_group
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -113,6 +112,7 @@ class RBLNModelRunnerV2(GPUModelRunner):
         unsupported = [
             name
             for name, enabled in (
+                ("pipeline parallelism", parallel_config.pipeline_parallel_size > 1),
                 ("LoRA", vllm_config.lora_config is not None),
                 ("multimodal models", model_config.is_multimodal_model),
                 ("the host-tensor path", not USE_DEVICE_TENSOR),
@@ -259,7 +259,7 @@ class RBLNModelRunnerV2(GPUModelRunner):
                 inputs_embeds=inputs_embeds,
                 **kwargs,
             )
-            if self.is_pooling_model or not self.is_last_pp_rank:
+            if self.is_pooling_model:
                 return model_output, None
             # eagle3's aux states leave the graph as one concatenated tensor:
             # a list of outputs that alias each other does not compile.
@@ -314,16 +314,6 @@ class RBLNModelRunnerV2(GPUModelRunner):
         )
         self.cache_config.num_gpu_blocks = self.kv_cache_config.num_blocks
         self.cache_config.num_cpu_blocks = 0
-
-    def recv_intermediate_tensors(self) -> IntermediateTensors:
-        # The previous stage sends its graph output as padded rows; upstream's
-        # execute_model copies flat token-major slices, and run_model views
-        # them back as rows.
-        received = get_pp_group().recv_tensor_dict()
-        assert isinstance(received, dict)
-        return IntermediateTensors(
-            {name: t.view(-1, t.shape[-1]) for name, t in received.items()}
-        )
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         super().update_requests(scheduler_output)
@@ -544,7 +534,6 @@ class RBLNModelRunnerV2(GPUModelRunner):
         )
         if (
             self.is_pooling_model
-            and self.is_last_pp_rank
             and not dummy_run
             and self.execute_model_state is not None
         ):
@@ -570,23 +559,12 @@ class RBLNModelRunnerV2(GPUModelRunner):
         step = self.step_shape
         assert step is not None
         layout = step.layout
-        intermediate_tensors = model_inputs["intermediate_tensors"]
-        if intermediate_tensors is not None:
-            intermediate_tensors = IntermediateTensors(
-                {
-                    name: t.view(layout.num_reqs_padded, layout.query_len_padded, -1)
-                    for name, t in intermediate_tensors.tensors.items()
-                }
-            )
         staged = self.input_stager.stage(
             input_ids=step.input_ids,
             positions=torch.from_numpy(step.positions),
-            intermediate_tensors=intermediate_tensors,
             token_indices=(
                 input_batch.logits_indices.to(torch.int32)
-                if self.is_prefill
-                and self.is_last_pp_rank
-                and not self.is_pooling_model
+                if self.is_prefill and not self.is_pooling_model
                 else None
             ),
             layout=layout,
@@ -600,10 +578,6 @@ class RBLNModelRunnerV2(GPUModelRunner):
         ):
             self.kv_connector.pre_forward(scheduler_output)
             outputs = self.model_executable(**staged.as_kwargs())
-        if not self.is_last_pp_rank:
-            model_output, _ = outputs
-            assert isinstance(model_output, IntermediateTensors)
-            return model_output
         if self.is_pooling_model:
             hidden_states, _ = outputs
             aux_hidden_states = []
@@ -674,9 +648,7 @@ class RBLNModelRunnerV2(GPUModelRunner):
         }
         self.kv_connector.set_disabled(True)
         self._dp_idle = not warmup
-        # Upstream's execute_model only checks that a non-first stage has a
-        # hand-off to slice on a dummy step; it reads its own buffer.
-        self.execute_model(scheduler_output, self.intermediate_tensors, dummy_run=True)
+        self.execute_model(scheduler_output, dummy_run=True)
         self._dp_idle = False
         self.kv_connector.set_disabled(False)
         state = self.execute_model_state

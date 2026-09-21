@@ -15,12 +15,15 @@
 """RBLNModelRunnerV2 against RBLNModelRunner on a batched decode, plus the
 torch sampler paths (seeded random sampling, penalties) it runs on the device."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from vllm import SamplingParams
 
 from tests.vllm.runners import DPRequest
 from tests.vllm.utils import check_logprobs_close, rbln_device_count
+from vllm_rbln.v2.worker.model_runner import RBLNModelRunnerV2
 
 MODEL = "Qwen/Qwen3-0.6B"
 PROMPTS = [
@@ -140,27 +143,6 @@ def test_pooling_matches_hf(hf_runner, vllm_runner, monkeypatch) -> None:
 
 
 @pytest.mark.model_compile
-def test_pipeline_parallel_matches_v1(vllm_runner, monkeypatch) -> None:
-    """Two stages hand hidden states forward and sampled tokens back. Compared
-    with RBLNModelRunner rather than HF: under PP both runners diverge from the
-    HF reference in the same way from the first token, which is a property of
-    the shared PP path and not of either runner."""
-    if rbln_device_count() < 2:
-        pytest.skip("pipeline parallelism needs 2 NPUs")
-    # max_num_seqs is split across the stages: 4 leaves a decode batch of 2.
-    with vllm_runner(MODEL, pipeline_parallel_size=2, max_num_seqs=4) as v1:
-        v1_outputs = v1.generate_greedy_logprobs(PROMPTS, MAX_TOKENS, 5)
-
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    with vllm_runner(MODEL, pipeline_parallel_size=2, max_num_seqs=4) as v2:
-        v2_outputs = v2.generate_greedy_logprobs(PROMPTS, MAX_TOKENS, 5)
-
-    check_logprobs_close(
-        outputs_0_lst=v1_outputs, outputs_1_lst=v2_outputs, name_0="v1", name_1="v2"
-    )
-
-
-@pytest.mark.model_compile
 def test_data_parallel_matches_hf(hf_runner, async_vllm_runner, monkeypatch) -> None:
     """Two DP ranks of a dense model: every step agrees the padded batch across
     ranks, an idle rank runs the busy rank's shape, and a rank finishing early
@@ -202,3 +184,15 @@ def test_data_parallel_matches_hf(hf_runner, async_vllm_runner, monkeypatch) -> 
         name_0="hf",
         name_1="v2 after its peer finished",
     )
+
+
+def test_pipeline_parallelism_is_refused() -> None:
+    """Upstream's PPHandler needs a sibling device group and Tensor.record_stream,
+    which RBLN does not provide; the runner refuses PP instead of patching it."""
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        model_config=SimpleNamespace(is_multimodal_model=False),
+        lora_config=None,
+    )
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        RBLNModelRunnerV2(vllm_config, torch.device("cpu"))
